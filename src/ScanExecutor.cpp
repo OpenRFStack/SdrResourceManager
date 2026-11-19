@@ -108,6 +108,23 @@ void ScanExecutor::loop()
                     s->updateSampleRate(e.sample_rate_sps);
                     s->updateCenterFreq(e.center_freq_hz);
                 }
+            // The dwell is time *delivered at this entry*: wait for the
+            // settle reads to be dropped first. Timing from retune() let the
+            // drain eat the dwell — 0.5 of 5 reads with 20 ms reads (RM-71).
+            // 50 ms slices so stop() is not held up; give up after 2 s (a
+            // stalled driver never completes its reads).
+            for (auto* s : streamers_)
+            {
+                int slices = 0;
+                while (s && s->isRunning() && running_.load()
+                       && !s->waitRetuneSettled(std::chrono::milliseconds(50)) && ++slices < 40)
+                {
+                }
+                if (slices >= 40)
+                    spdlog::warn("ScanExecutor [{}] step {}: retune drain did not finish in 2 s",
+                                 task_id_,
+                                 i);
+            }
             spdlog::debug("ScanExecutor [{}] step {} cf={:.3f}MHz dwell={}ms",
                           task_id_,
                           i + 1,

@@ -116,6 +116,12 @@ public:
     // already buffered still carry the old LO (RM-65).
     void pauseForRetune(int settle_reads);
 
+    /// Block until the reads requested by pauseForRetune() have been dropped
+    /// (or the streamer stops / @p timeout passes). The scan dwell starts
+    /// after this, so it is not eaten by the drain (RM-71). Returns false on
+    /// timeout.
+    bool waitRetuneSettled(std::chrono::milliseconds timeout) const;
+
     // Multi-destination fan-out. Each task subscribes with its own UDP endpoint.
     // start() auto-adds the dest from Config if dest_ip is non-empty.
     // `epoch` = the subscribing task's start (default: this streamer's epoch).

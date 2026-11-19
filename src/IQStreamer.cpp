@@ -26,6 +26,7 @@ Contact author for permission: https://github.com/OpenRFStack
 #include <chrono>
 #include <cmath>
 #include <stdexcept>
+#include <thread>
 
 namespace sdr
 {
@@ -444,6 +445,22 @@ void IQStreamer::updateSampleRate(double new_sr_sps)
 void IQStreamer::pauseForRetune(int settle_reads)
 {
     drain_countdown_.store(settle_reads, std::memory_order_release);
+}
+
+bool IQStreamer::waitRetuneSettled(std::chrono::milliseconds timeout) const
+{
+    // Polled: a drained read takes ≥ one driver read (≥ ~0.1 ms), so 200 µs
+    // granularity costs nothing and keeps the read loop free of a condvar.
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (drain_countdown_.load(std::memory_order_acquire) > 0)
+    {
+        if (!running_.load(std::memory_order_acquire))
+            return true;
+        if (std::chrono::steady_clock::now() >= deadline)
+            return false;
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    return true;
 }
 
 // ── Batched send ─────────────────────────────────────────────────────────────

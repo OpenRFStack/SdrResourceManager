@@ -1370,6 +1370,59 @@ TEST(AuditRegression, CFG07_PacketSizeBeyondUdpLimitIsRejected)
         << "9000 samples = 72032-byte datagrams: every send fails with EMSGSIZE";
 }
 
+// ═══ RM-71 — the scan dwell lost the reads discarded after a retune ═══
+// The dwell timer started when retune() returned, but the streamer then
+// drops `retune_settle_reads` reads (RM-65) — inside the dwell. With slow
+// driver reads (here 20 ms, 3 settle reads) a 100 ms dwell delivered ~2 reads;
+// with an MTU-sized read longer than the dwell an entry delivered nothing.
+TEST(AuditRegression, RM71_ScanDwellExcludesTheRetuneDrain)
+{
+    FakeSoapy::reset();
+    FakeSoapy::read_delay_us.store(20'000);
+    auto cfg                           = cfgA(1, 46'460, 46'479);
+    cfg.devices[0].retune_settle_reads = 3;
+    ResourceManager rm(cfg, noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 1);
+    UdpRx rx;
+    ASSERT_GT(rx.port, 0);
+    TaskRequest scan;
+    scan.msg_type             = "TASK_REQUEST_SCAN";
+    scan.request_id           = "dwell-scan";
+    scan.task_type            = TaskType::SCAN;
+    scan.rf.rx_count          = 1;
+    scan.streaming.dest_ip    = "127.0.0.1";
+    scan.streaming.dest_ports = {rx.port};
+    ScanParams sp;
+    sp.repeat        = false;
+    sp.entries       = {entry(100e6, 1e6, 100), entry(300e6, 1e6, 100), entry(500e6, 1e6, 100)};
+    scan.scan_params = sp;
+    auto resp        = rm.tryAccept(scan);
+    ASSERT_TRUE(resp.accepted) << resp.reject_reason;
+    IqPacketHeader                   h{};
+    std::vector<std::complex<float>> iq;
+    // Span of the reads labelled with the middle entry (bounded both sides).
+    steady_clock::time_point first{}, last{};
+    auto                     dl = steady_clock::now() + seconds(3);
+    while (steady_clock::now() < dl)
+    {
+        if (!rx.recv(h, iq, 300))
+            continue;
+        if (h.center_freq_hz == 300'000'000ull)
+        {
+            last = steady_clock::now();
+            if (first == steady_clock::time_point{})
+                first = last;
+        }
+        if (h.center_freq_hz == 500'000'000ull)
+            break;
+    }
+    ASSERT_NE(first, steady_clock::time_point{});
+    // 100 ms dwell of 20 ms reads: ≥ 4 reads (60 ms first→last) must be the
+    // entry's own. Before: the 3 dropped reads came out of the dwell (20 ms).
+    const auto span_ms = duration_cast<milliseconds>(last - first).count();
+    EXPECT_GE(span_ms, 50) << "middle entry delivered reads over only " << span_ms << " ms";
+}
+
 /*
 ========================================================================
 End of file — OpenRFStack

@@ -846,6 +846,12 @@ Edit `config/devices.xml`, add a new `<device>` block:
        shared_lo=false: channels tune independently (RTL-SDR, HackRF, USRP B210). -->
   <shared_lo>true</shared_lo>
 
+  <!-- Driver reads dropped after every scan / combined-window retune: what the
+       driver had already buffered was captured at the previous LO. Scan dwell_ms
+       is counted after the drop, so each entry costs retune + N reads + dwell.
+       Default 2; raise for deep-buffered drivers (unverified per radio). -->
+  <retune_settle_reads>2</retune_settle_reads>
+
   <!-- Assign to a coherency_group if this board shares a reference clock
        with other boards and you want coherent multi-board DF tasks. -->
   <coherency_group>refclk-group-0</coherency_group>

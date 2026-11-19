@@ -370,15 +370,21 @@ Key behaviors:
 ```cpp
 for each entry in params.entries (repeat=true → loop forever):
     step_.store(i)
-    retune_(entry.center_freq_hz, entry.sample_rate_sps)    // calls RadioDevice::retune()
-    for each IQStreamer: updateCenterFreq(entry.center_freq_hz)
-    sleep until dwell_ms elapsed (in 50ms increments, checking running_)
+    for each IQStreamer: pauseForRetune(settle_reads)        // drop the next N reads (RM-65)
+    retune_(entry.center_freq_hz, entry.sample_rate_sps)     // RadioDevice::tune()
+    for each IQStreamer: updateSampleRate(sr); updateCenterFreq(cf)   // next packet: DWELL_CHANGE
+    for each IQStreamer: waitRetuneSettled()                 // 50 ms slices, ≤ 2 s (RM-71)
+    wait_cv_.wait_until(now + dwell_ms)                      // stop() wakes it immediately
 
-→ done_(task_id, ok=true)
+→ done_(task_id, ok = at least one entry tuned)
 ```
 
-The 50ms poll granularity means minimum effective dwell ≈ 50ms regardless of `dwell_ms`
-config. Production scan plans should use `dwell_ms ≥ 100` for reliable timing.
+`settle_reads` is the device's `<retune_settle_reads>` (default 2; a scan uses the largest of its
+devices). The reads still in the driver pipeline at a retune carry the previous LO, so they are
+dropped instead of being labelled with the new CF. `dwell_ms` is counted **after** that drain, i.e.
+it is the time delivered at the entry: with 20 ms driver reads and 3 settle reads, timing the dwell
+from `retune_()` left a 100 ms entry with 20 ms of samples (and an entry shorter than the drain with
+none). Each entry therefore occupies ≈ retune + settle_reads × read time + dwell_ms of wall time.
 
 ---
 
