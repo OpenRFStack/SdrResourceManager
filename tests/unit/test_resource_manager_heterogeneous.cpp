@@ -17,11 +17,13 @@ Contact author for permission: https://github.com/OpenRFStack
  * in a single ResourceManager pool, matching the SoapySDR device-pool model
  * documented in config/devices.xml ("no code changes required to add a board").
  */
-#include <gtest/gtest.h>
-#include "ResourceManager.hpp"
-#include "sdr/Types.hpp"
-#include "sdr/MessageCodec.hpp"
 #include "FakeSoapyControl.hpp"
+#include "ResourceManager.hpp"
+#include "sdr/MessageCodec.hpp"
+#include "sdr/Types.hpp"
+
+#include <gtest/gtest.h>
+
 #include <cmath>
 #include <set>
 #include <string>
@@ -29,13 +31,14 @@ Contact author for permission: https://github.com/OpenRFStack
 using namespace sdr;
 using namespace std::chrono;
 
-static int64_t nowMs() {
-    return duration_cast<milliseconds>(
-        system_clock::now().time_since_epoch()).count();
+static int64_t nowMs()
+{
+    return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
 // 4 Pluto-class + 2 RTL-SDR-class devices on the "fake" SoapySDR driver.
-static AppConfig makeMixedConfig() {
+static AppConfig makeMixedConfig()
+{
     AppConfig cfg;
     cfg.policy.max_concurrent_tasks    = 64;
     cfg.policy.guard_band_hz           = 200e3;
@@ -43,13 +46,14 @@ static AppConfig makeMixedConfig() {
     cfg.policy.default_task_timeout_ms = 60'000;
     cfg.policy.scheduler_tick_ms       = 60'000;
     cfg.policy.watchdog_tick_ms        = 60'000;
-    cfg.policy.udp_port_pool_start     = 47000;
-    cfg.policy.udp_port_pool_end       = 47999;
+    cfg.policy.udp_port_pool_start     = 47'000;
+    cfg.policy.udp_port_pool_end       = 47'999;
     cfg.policy.iq_packet_samples       = 128;
     cfg.policy.retune_conflict_policy  = RetuneConflictPolicy::REJECT_NEW;
     cfg.policy.heartbeat_interval_ms   = 10'000;
 
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 4; ++i)
+    {
         DeviceConfig dc;
         dc.id                       = "pluto-" + std::to_string(i);
         dc.driver                   = "fake";
@@ -71,14 +75,15 @@ static AppConfig makeMixedConfig() {
         cfg.devices.push_back(dc);
     }
 
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 2; ++i)
+    {
         DeviceConfig dc;
         dc.id                       = "rtlsdr-" + std::to_string(i);
         dc.driver                   = "fake";
         dc.uri                      = "fake";
         dc.label                    = "Fake RTL-SDR " + std::to_string(i);
         dc.streaming_source_ip      = "127.0.0.1";
-        dc.coherency_group          = "rtlsdr-" + std::to_string(i); // independent
+        dc.coherency_group          = "rtlsdr-" + std::to_string(i);  // independent
         dc.shared_lo                = false;
         dc.caps.rx_channels         = 1;
         dc.caps.tx_channels         = 0;
@@ -87,7 +92,7 @@ static AppConfig makeMixedConfig() {
         dc.caps.bandwidth_max_hz    = 3.2e6;
         dc.caps.sample_rate_max_sps = 3.2e6;
         // Real RTL2832U hardware rejects setSampleRate() below ~225,001 Hz.
-        dc.caps.sample_rate_min_sps = 225001;
+        dc.caps.sample_rate_min_sps = 225'001;
         dc.caps.rx_gain_min_db      = 0;
         dc.caps.rx_gain_max_db      = 49.6;
         dc.caps.tx_atten_min_db     = 0;
@@ -99,10 +104,14 @@ static AppConfig makeMixedConfig() {
 }
 
 static TaskRequest makeContinuousRequest(const std::string& req_id,
-                                          double cf, double bw, double sr,
-                                          int rx_count = 1, int tx_count = 0,
-                                          int rank = 1,
-                                          const std::string& preferred = "") {
+                                         double             cf,
+                                         double             bw,
+                                         double             sr,
+                                         int                rx_count  = 1,
+                                         int                tx_count  = 0,
+                                         int                rank      = 1,
+                                         const std::string& preferred = "")
+{
     TaskRequest r;
     r.msg_type            = "TASK_REQUEST_CONTINUOUS";
     r.request_id          = req_id;
@@ -125,44 +134,78 @@ static TaskRequest makeContinuousRequest(const std::string& req_id,
 
 // ── Pool composition ─────────────────────────────────────────────────────────
 
-TEST(MixedPool, AllSixDevicesOpen) {
+TEST(MixedPool, AllSixDevicesOpen)
+{
     FakeSoapy::reset();
-    ResourceManager rm(makeMixedConfig(), [](const TaskRecord&){}, [](const auto&,const auto&){});
+    ResourceManager rm(
+        makeMixedConfig(),
+        [](const TaskRecord&)
+        {
+        },
+        [](const auto&, const auto&)
+        {
+        });
     ASSERT_EQ(rm.openDevices(), 6);
 
     auto s = rm.deviceSummaries();
     EXPECT_EQ(s.size(), 6u);
-    int online = std::count_if(s.begin(), s.end(), [](const auto& x){ return x.online; });
+    int online = std::count_if(s.begin(),
+                               s.end(),
+                               [](const auto& x)
+                               {
+                                   return x.online;
+                               });
     EXPECT_EQ(online, 6);
 }
 
 // ── PlutoSDR-class devices ───────────────────────────────────────────────────
 
-TEST(MixedPool, AllFourPlutosAcceptDualChannelTask) {
+TEST(MixedPool, AllFourPlutosAcceptDualChannelTask)
+{
     FakeSoapy::reset();
-    ResourceManager rm(makeMixedConfig(), [](const TaskRecord&){}, [](const auto&,const auto&){});
+    ResourceManager rm(
+        makeMixedConfig(),
+        [](const TaskRecord&)
+        {
+        },
+        [](const auto&, const auto&)
+        {
+        });
     ASSERT_EQ(rm.openDevices(), 6);
 
     std::set<std::string> devs;
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 4; ++i)
+    {
         // 2 RX task, well within Pluto's 70MHz-6GHz / 2ch capability (2 RX
         // already rules out the 1-channel RTL-SDRs). TX is no longer requested:
         // the controller never opened TX streams, so it now rejects tx_count>0
         // instead of advertising a dead TX port (audit RM-58).
-        auto resp = rm.tryAccept(makeContinuousRequest(
-            "pluto-task-" + std::to_string(i), 433e6 + i * 100e6, 8e6, 10e6,
-            /*rx*/2, /*tx*/0));
+        auto resp = rm.tryAccept(makeContinuousRequest("pluto-task-" + std::to_string(i),
+                                                       433e6 + i * 100e6,
+                                                       8e6,
+                                                       10e6,
+                                                       /*rx*/ 2,
+                                                       /*tx*/ 0));
         ASSERT_TRUE(resp.accepted) << "Pluto task " << i << " rejected: " << resp.reject_reason;
         ASSERT_FALSE(resp.streams.empty());
         devs.insert(resp.streams[0].device_id);
     }
     EXPECT_EQ(devs.size(), 4u);
-    for (const auto& d : devs) EXPECT_EQ(d.rfind("pluto-", 0), 0u);
+    for (const auto& d : devs)
+        EXPECT_EQ(d.rfind("pluto-", 0), 0u);
 }
 
-TEST(MixedPool, PlutoRejectsBeyond6GHz) {
+TEST(MixedPool, PlutoRejectsBeyond6GHz)
+{
     FakeSoapy::reset();
-    ResourceManager rm(makeMixedConfig(), [](const TaskRecord&){}, [](const auto&,const auto&){});
+    ResourceManager rm(
+        makeMixedConfig(),
+        [](const TaskRecord&)
+        {
+        },
+        [](const auto&, const auto&)
+        {
+        });
     ASSERT_EQ(rm.openDevices(), 6);
 
     auto resp = rm.tryAccept(makeContinuousRequest("too-high", 7e9, 8e6, 10e6, 2, 2));
@@ -172,24 +215,37 @@ TEST(MixedPool, PlutoRejectsBeyond6GHz) {
 
 // ── RTL-SDR-class devices ────────────────────────────────────────────────────
 
-TEST(MixedPool, BothRtlSdrsAcceptSingleChannelTask) {
+TEST(MixedPool, BothRtlSdrsAcceptSingleChannelTask)
+{
     FakeSoapy::reset();
-    ResourceManager rm(makeMixedConfig(), [](const TaskRecord&){}, [](const auto&,const auto&){});
+    ResourceManager rm(
+        makeMixedConfig(),
+        [](const TaskRecord&)
+        {
+        },
+        [](const auto&, const auto&)
+        {
+        });
     ASSERT_EQ(rm.openDevices(), 6);
 
     std::set<std::string> devs;
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 2; ++i)
+    {
         // 1 RX / 0 TX task within RTL-SDR's 24MHz-1.766GHz capability
-        auto resp = rm.tryAccept(makeContinuousRequest(
-            "rtl-task-" + std::to_string(i), 100e6 + i * 50e6, 2e6, 2.4e6,
-            /*rx*/1, /*tx*/0));
+        auto resp = rm.tryAccept(makeContinuousRequest("rtl-task-" + std::to_string(i),
+                                                       100e6 + i * 50e6,
+                                                       2e6,
+                                                       2.4e6,
+                                                       /*rx*/ 1,
+                                                       /*tx*/ 0));
         ASSERT_TRUE(resp.accepted) << "RTL task " << i << " rejected: " << resp.reject_reason;
         ASSERT_FALSE(resp.streams.empty());
         EXPECT_EQ(resp.streams[0].channel_index, 0);
         devs.insert(resp.streams[0].device_id);
     }
     EXPECT_EQ(devs.size(), 2u);
-    for (const auto& d : devs) EXPECT_EQ(d.rfind("rtlsdr-", 0), 0u);
+    for (const auto& d : devs)
+        EXPECT_EQ(d.rfind("rtlsdr-", 0), 0u);
 }
 
 // FM_NB-class request (50 kHz) is well below RTL-SDR's ~225,001 Hz hardware
@@ -197,13 +253,21 @@ TEST(MixedPool, BothRtlSdrsAcceptSingleChannelTask) {
 // multiple of the requested rate that clears the floor; the DDC decimates
 // back down to what was asked for transparently (see ResourceManager.cpp's
 // findBestDevice + activateTask's tuneChannel/independent-LO branch).
-TEST(MixedPool, RtlSdrClampsBelowFloorRateInsteadOfRejecting) {
+TEST(MixedPool, RtlSdrClampsBelowFloorRateInsteadOfRejecting)
+{
     FakeSoapy::reset();
-    ResourceManager rm(makeMixedConfig(), [](const TaskRecord&){}, [](const auto&,const auto&){});
+    ResourceManager rm(
+        makeMixedConfig(),
+        [](const TaskRecord&)
+        {
+        },
+        [](const auto&, const auto&)
+        {
+        });
     ASSERT_EQ(rm.openDevices(), 6);
 
     auto resp = rm.tryAccept(makeContinuousRequest(
-        "rtl-fm-nb", 100e6, 25e3, 50e3, /*rx*/1, /*tx*/0, /*rank*/1, "rtlsdr-0"));
+        "rtl-fm-nb", 100e6, 25e3, 50e3, /*rx*/ 1, /*tx*/ 0, /*rank*/ 1, "rtlsdr-0"));
     ASSERT_TRUE(resp.accepted) << "rejected: " << resp.reject_reason;
     ASSERT_FALSE(resp.streams.empty());
 
@@ -219,55 +283,81 @@ TEST(MixedPool, RtlSdrClampsBelowFloorRateInsteadOfRejecting) {
 // limits are enforced when no Pluto-class device is present to pick up the
 // task instead (preferred_device is only a placement hint, not a hard
 // constraint, so these checks must be done with an RTL-SDR-only pool).
-static AppConfig makeRtlOnlyConfig() {
+static AppConfig makeRtlOnlyConfig()
+{
     AppConfig cfg = makeMixedConfig();
     cfg.devices.erase(cfg.devices.begin(), cfg.devices.begin() + 4);
     return cfg;
 }
 
-TEST(MixedPool, RtlSdrRejectsAboveFreqCeiling) {
+TEST(MixedPool, RtlSdrRejectsAboveFreqCeiling)
+{
     FakeSoapy::reset();
-    ResourceManager rm(makeRtlOnlyConfig(), [](const TaskRecord&){}, [](const auto&,const auto&){});
+    ResourceManager rm(
+        makeRtlOnlyConfig(),
+        [](const TaskRecord&)
+        {
+        },
+        [](const auto&, const auto&)
+        {
+        });
     ASSERT_EQ(rm.openDevices(), 2);
 
     // 2.4 GHz is above RTL-SDR's 1.766 GHz ceiling; with no Pluto-class
     // device in the pool, this must be rejected as out of range.
-    auto resp = rm.tryAccept(makeContinuousRequest(
-        "rtl-too-high", 2.4e9, 2e6, 2.4e6, 1, 0));
+    auto resp = rm.tryAccept(makeContinuousRequest("rtl-too-high", 2.4e9, 2e6, 2.4e6, 1, 0));
     EXPECT_FALSE(resp.accepted);
     EXPECT_EQ(resp.reject_code, RejectCode::FREQ_OUT_OF_RANGE);
 }
 
-TEST(MixedPool, RtlSdrRejectsTxRequest) {
+TEST(MixedPool, RtlSdrRejectsTxRequest)
+{
     FakeSoapy::reset();
-    ResourceManager rm(makeRtlOnlyConfig(), [](const TaskRecord&){}, [](const auto&,const auto&){});
+    ResourceManager rm(
+        makeRtlOnlyConfig(),
+        [](const TaskRecord&)
+        {
+        },
+        [](const auto&, const auto&)
+        {
+        });
     ASSERT_EQ(rm.openDevices(), 2);
 
     // RTL-SDR has tx_channels=0; with no Pluto-class device in the pool,
     // a task requiring TX must be rejected outright.
-    auto resp = rm.tryAccept(makeContinuousRequest(
-        "rtl-tx", 100e6, 2e6, 2.4e6, /*rx*/1, /*tx*/1));
+    auto resp =
+        rm.tryAccept(makeContinuousRequest("rtl-tx", 100e6, 2e6, 2.4e6, /*rx*/ 1, /*tx*/ 1));
     EXPECT_FALSE(resp.accepted);
 }
 
 // ── Full mixed pool exercised together ───────────────────────────────────────
 
-TEST(MixedPool, AllSixDevicesServeOneTaskEach) {
+TEST(MixedPool, AllSixDevicesServeOneTaskEach)
+{
     FakeSoapy::reset();
-    ResourceManager rm(makeMixedConfig(), [](const TaskRecord&){}, [](const auto&,const auto&){});
+    ResourceManager rm(
+        makeMixedConfig(),
+        [](const TaskRecord&)
+        {
+        },
+        [](const auto&, const auto&)
+        {
+        });
     ASSERT_EQ(rm.openDevices(), 6);
 
     std::set<std::string> devs;
 
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 4; ++i)
+    {
         auto resp = rm.tryAccept(makeContinuousRequest(
-            "pluto-" + std::to_string(i), 433e6 + i * 100e6, 8e6, 10e6, 2, 0));   // RM-58: no TX
+            "pluto-" + std::to_string(i), 433e6 + i * 100e6, 8e6, 10e6, 2, 0));  // RM-58: no TX
         ASSERT_TRUE(resp.accepted) << "pluto task " << i << ": " << resp.reject_reason;
         devs.insert(resp.streams[0].device_id);
     }
-    for (int i = 0; i < 2; ++i) {
-        auto resp = rm.tryAccept(makeContinuousRequest(
-            "rtl-" + std::to_string(i), 100e6 + i * 50e6, 2e6, 2.4e6, 1, 0));
+    for (int i = 0; i < 2; ++i)
+    {
+        auto resp = rm.tryAccept(
+            makeContinuousRequest("rtl-" + std::to_string(i), 100e6 + i * 50e6, 2e6, 2.4e6, 1, 0));
         ASSERT_TRUE(resp.accepted) << "rtl task " << i << ": " << resp.reject_reason;
         devs.insert(resp.streams[0].device_id);
     }

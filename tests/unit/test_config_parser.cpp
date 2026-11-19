@@ -10,20 +10,23 @@ Do not use for commercial, organizational, or military purposes.
 Contact author for permission: https://github.com/OpenRFStack
 ========================================================================
 */
-#include <gtest/gtest.h>
 #include "ConfigParser.hpp"
-#include <fstream>
+
+#include <gtest/gtest.h>
 #include <unistd.h>
+
+#include <fstream>
 #include <stdexcept>
 
 using namespace sdr;
 
-static std::string writeTmp(const std::string& xml) {
+static std::string writeTmp(const std::string& xml)
+{
     // Unique per process: ctest runs every test as its own process in
     // parallel, and a shared fixed path let tests read each other's XML.
-    static int n = 0;
-    const std::string path = "/tmp/sdr_test_config_" + std::to_string(::getpid()) + "_"
-                           + std::to_string(n++) + ".xml";
+    static int        n = 0;
+    const std::string path =
+        "/tmp/sdr_test_config_" + std::to_string(::getpid()) + "_" + std::to_string(n++) + ".xml";
     std::ofstream f(path);
     f << xml;
     return path;
@@ -99,59 +102,64 @@ static const std::string kValidXml = R"xml(<?xml version="1.0"?>
 </sdr_controller>
 )xml";
 
-TEST(ConfigParser, ParsesValidXml_Broker) {
+TEST(ConfigParser, ParsesValidXml_Broker)
+{
     auto cfg = ConfigParser::parse(writeTmp(kValidXml));
-    EXPECT_EQ(cfg.broker.url,      "amqp://broker:5672");
+    EXPECT_EQ(cfg.broker.url, "amqp://broker:5672");
     EXPECT_EQ(cfg.broker.username, "user1");
     EXPECT_EQ(cfg.broker.password, "pass1");
-    EXPECT_EQ(cfg.broker.reconnect_interval_sec,     3);
+    EXPECT_EQ(cfg.broker.reconnect_interval_sec, 3);
     EXPECT_EQ(cfg.broker.max_reconnect_interval_sec, 30);
-    EXPECT_EQ(cfg.broker.send_queue_depth,           256);
+    EXPECT_EQ(cfg.broker.send_queue_depth, 256);
 }
 
-TEST(ConfigParser, ParsesValidXml_Policy) {
+TEST(ConfigParser, ParsesValidXml_Policy)
+{
     auto cfg = ConfigParser::parse(writeTmp(kValidXml));
     EXPECT_EQ(cfg.policy.max_concurrent_tasks, 32);
-    EXPECT_DOUBLE_EQ(cfg.policy.guard_band_hz,      100e3);
+    EXPECT_DOUBLE_EQ(cfg.policy.guard_band_hz, 100e3);
     EXPECT_DOUBLE_EQ(cfg.policy.usable_bw_fraction, 0.75);
-    EXPECT_EQ(cfg.policy.scheduler_tick_ms,   100);
-    EXPECT_EQ(cfg.policy.udp_port_pool_start, 40000);
-    EXPECT_EQ(cfg.policy.udp_port_pool_end,   40099);
-    EXPECT_EQ(cfg.policy.iq_packet_samples,   128);
+    EXPECT_EQ(cfg.policy.scheduler_tick_ms, 100);
+    EXPECT_EQ(cfg.policy.udp_port_pool_start, 40'000);
+    EXPECT_EQ(cfg.policy.udp_port_pool_end, 40'099);
+    EXPECT_EQ(cfg.policy.iq_packet_samples, 128);
     EXPECT_EQ(cfg.policy.retune_conflict_policy, RetuneConflictPolicy::CANCEL_LOWER);
     EXPECT_EQ(cfg.policy.heartbeat_interval_ms, 5000);
 }
 
-TEST(ConfigParser, ParsesValidXml_Devices) {
+TEST(ConfigParser, ParsesValidXml_Devices)
+{
     auto cfg = ConfigParser::parse(writeTmp(kValidXml));
     ASSERT_EQ(cfg.devices.size(), 2u);
 
     auto& d0 = cfg.devices[0];
-    EXPECT_EQ(d0.id,                  "dev-0");
-    EXPECT_EQ(d0.driver,              "fake");
-    EXPECT_EQ(d0.uri,                 "fake://0");
-    EXPECT_EQ(d0.label,               "Fake Board 0");
+    EXPECT_EQ(d0.id, "dev-0");
+    EXPECT_EQ(d0.driver, "fake");
+    EXPECT_EQ(d0.uri, "fake://0");
+    EXPECT_EQ(d0.label, "Fake Board 0");
     EXPECT_EQ(d0.streaming_source_ip, "192.168.1.10");
-    EXPECT_EQ(d0.coherency_group,     "group-a");
-    EXPECT_EQ(d0.caps.rx_channels,    2);
-    EXPECT_EQ(d0.caps.tx_channels,    1);
-    EXPECT_DOUBLE_EQ(d0.caps.bandwidth_max_hz,    40e6);
+    EXPECT_EQ(d0.coherency_group, "group-a");
+    EXPECT_EQ(d0.caps.rx_channels, 2);
+    EXPECT_EQ(d0.caps.tx_channels, 1);
+    EXPECT_DOUBLE_EQ(d0.caps.bandwidth_max_hz, 40e6);
     EXPECT_DOUBLE_EQ(d0.caps.sample_rate_max_sps, 30.72e6);
 
     auto& d1 = cfg.devices[1];
-    EXPECT_EQ(d1.id,               "dev-1");
+    EXPECT_EQ(d1.id, "dev-1");
     EXPECT_EQ(d1.caps.rx_channels, 2);
     EXPECT_EQ(d1.caps.tx_channels, 2);
     EXPECT_DOUBLE_EQ(d1.caps.rx_gain_min_db, -3.0);
-    EXPECT_DOUBLE_EQ(d1.caps.rx_gain_max_db,  71.0);
+    EXPECT_DOUBLE_EQ(d1.caps.rx_gain_max_db, 71.0);
 }
 
-TEST(ConfigParser, MissingRootElementThrows) {
+TEST(ConfigParser, MissingRootElementThrows)
+{
     std::string xml = R"xml(<?xml version="1.0"?><wrong_root/>)xml";
     EXPECT_THROW(ConfigParser::parse(writeTmp(xml)), std::runtime_error);
 }
 
-TEST(ConfigParser, EmptyDeviceListThrows) {
+TEST(ConfigParser, EmptyDeviceListThrows)
+{
     std::string xml = R"xml(<?xml version="1.0"?>
 <sdr_controller version="2.0">
   <broker>
@@ -168,9 +176,9 @@ TEST(ConfigParser, EmptyDeviceListThrows) {
     EXPECT_THROW(ConfigParser::parse(writeTmp(xml)), std::runtime_error);
 }
 
-TEST(ConfigParser, FileNotFoundThrows) {
-    EXPECT_THROW(ConfigParser::parse("/nonexistent/path/config.xml"),
-                 std::runtime_error);
+TEST(ConfigParser, FileNotFoundThrows)
+{
+    EXPECT_THROW(ConfigParser::parse("/nonexistent/path/config.xml"), std::runtime_error);
 }
 
 // ── Edge cases ────────────────────────────────────────────────────────────────
@@ -217,48 +225,55 @@ static const std::string kSingleDeviceXml = R"xml(<?xml version="1.0"?>
 </sdr_controller>
 )xml";
 
-TEST(ConfigParser, RejectNewPolicyParsed) {
+TEST(ConfigParser, RejectNewPolicyParsed)
+{
     auto cfg = ConfigParser::parse(writeTmp(kSingleDeviceXml));
     EXPECT_EQ(cfg.policy.retune_conflict_policy, RetuneConflictPolicy::REJECT_NEW);
 }
 
-TEST(ConfigParser, SingleDeviceParsed) {
+TEST(ConfigParser, SingleDeviceParsed)
+{
     auto cfg = ConfigParser::parse(writeTmp(kSingleDeviceXml));
     ASSERT_EQ(cfg.devices.size(), 1u);
-    EXPECT_EQ(cfg.devices[0].id,     "dev-only");
+    EXPECT_EQ(cfg.devices[0].id, "dev-only");
     EXPECT_EQ(cfg.devices[0].driver, "null");
     EXPECT_EQ(cfg.devices[0].caps.rx_channels, 1);
     EXPECT_EQ(cfg.devices[0].caps.tx_channels, 0);
 }
 
-TEST(ConfigParser, DeviceWithoutCoherencyGroupHasEmptyGroup) {
+TEST(ConfigParser, DeviceWithoutCoherencyGroupHasEmptyGroup)
+{
     // kSingleDeviceXml has no <coherency_group> element.
     auto cfg = ConfigParser::parse(writeTmp(kSingleDeviceXml));
     ASSERT_EQ(cfg.devices.size(), 1u);
     EXPECT_TRUE(cfg.devices[0].coherency_group.empty());
 }
 
-TEST(ConfigParser, BrokerQueueNamesPreserved) {
+TEST(ConfigParser, BrokerQueueNamesPreserved)
+{
     auto cfg = ConfigParser::parse(writeTmp(kValidXml));
-    EXPECT_EQ(cfg.broker.request_queue,  "sdr.task.request");
+    EXPECT_EQ(cfg.broker.request_queue, "sdr.task.request");
     EXPECT_EQ(cfg.broker.response_queue, "sdr.task.response");
-    EXPECT_EQ(cfg.broker.status_topic,   "sdr.status");
-    EXPECT_EQ(cfg.broker.health_topic,   "sdr.health");
+    EXPECT_EQ(cfg.broker.status_topic, "sdr.status");
+    EXPECT_EQ(cfg.broker.health_topic, "sdr.health");
 }
 
-TEST(ConfigParser, DefaultTaskTimeoutMsIsPositive) {
+TEST(ConfigParser, DefaultTaskTimeoutMsIsPositive)
+{
     auto cfg = ConfigParser::parse(writeTmp(kValidXml));
     EXPECT_GT(cfg.policy.default_task_timeout_ms, 0);
 }
 
-TEST(ConfigParser, DeviceFreqRangeParsed) {
+TEST(ConfigParser, DeviceFreqRangeParsed)
+{
     auto cfg = ConfigParser::parse(writeTmp(kValidXml));
     ASSERT_GE(cfg.devices.size(), 1u);
-    EXPECT_DOUBLE_EQ(cfg.devices[0].caps.freq_min_hz,  70e6);
-    EXPECT_DOUBLE_EQ(cfg.devices[0].caps.freq_max_hz,  6000e6);
+    EXPECT_DOUBLE_EQ(cfg.devices[0].caps.freq_min_hz, 70e6);
+    EXPECT_DOUBLE_EQ(cfg.devices[0].caps.freq_max_hz, 6000e6);
 }
 
-TEST(ConfigParser, RxAgcDefaultsToFalseWithManualGain) {
+TEST(ConfigParser, RxAgcDefaultsToFalseWithManualGain)
+{
     // kSingleDeviceXml has no <rx_agc>/<rx_gain_db> elements.
     auto cfg = ConfigParser::parse(writeTmp(kSingleDeviceXml));
     ASSERT_EQ(cfg.devices.size(), 1u);
@@ -266,7 +281,8 @@ TEST(ConfigParser, RxAgcDefaultsToFalseWithManualGain) {
     EXPECT_DOUBLE_EQ(cfg.devices[0].rx_gain_db, 30.0);
 }
 
-TEST(ConfigParser, RxAgcAndGainParsedWhenPresent) {
+TEST(ConfigParser, RxAgcAndGainParsedWhenPresent)
+{
     static const std::string kXml = R"xml(<?xml version="1.0"?>
 <sdr_controller version="2.0">
   <broker><url>amqp://broker:5672</url></broker>
@@ -280,7 +296,7 @@ TEST(ConfigParser, RxAgcAndGainParsedWhenPresent) {
   </devices>
 </sdr_controller>
 )xml";
-    auto cfg = ConfigParser::parse(writeTmp(kXml));
+    auto                     cfg  = ConfigParser::parse(writeTmp(kXml));
     ASSERT_EQ(cfg.devices.size(), 1u);
     EXPECT_TRUE(cfg.devices[0].rx_agc);
     EXPECT_DOUBLE_EQ(cfg.devices[0].rx_gain_db, 42.5);

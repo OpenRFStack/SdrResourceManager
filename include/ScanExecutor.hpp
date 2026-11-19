@@ -20,35 +20,49 @@ or the task is cancelled.
  */
 #pragma once
 #include "sdr/Types.hpp"
+
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
-#include <functional>
-#include <string>
 
-namespace sdr {
+namespace sdr
+{
 class IQStreamer;
 
-class ScanExecutor {
+class ScanExecutor
+{
 public:
     // Called by ScanExecutor to retune before each dwell.
     // Returns true on success. Signature: (center_freq_hz, sample_rate_sps).
     using RetuneFn = std::function<bool(double cf_hz, double sr_sps)>;
     using DoneCb   = std::function<void(const std::string& task_id, bool ok)>;
 
-    ScanExecutor(const std::string& task_id, const ScanParams& params,
-                 RetuneFn retune, std::vector<IQStreamer*> streamers, DoneCb done,
-                 int settle_reads = 2);
+    ScanExecutor(const std::string&       task_id,
+                 const ScanParams&        params,
+                 RetuneFn                 retune,
+                 std::vector<IQStreamer*> streamers,
+                 DoneCb                   done,
+                 int                      settle_reads = 2);
     ~ScanExecutor();
-    ScanExecutor(const ScanExecutor&)=delete;
-    ScanExecutor& operator=(const ScanExecutor&)=delete;
+    ScanExecutor(const ScanExecutor&)            = delete;
+    ScanExecutor& operator=(const ScanExecutor&) = delete;
 
     void start();
     void stop();
-    bool isRunning()    const { return running_.load(); }
-    int  currentStep()  const { return step_.load(); }
+
+    bool isRunning() const
+    {
+        return running_.load();
+    }
+
+    int currentStep() const
+    {
+        return step_.load();
+    }
 
 private:
     std::string              task_id_;
@@ -56,15 +70,15 @@ private:
     RetuneFn                 retune_;
     std::vector<IQStreamer*> streamers_;
     DoneCb                   done_;
-    int                      settle_reads_ = 2;   ///< reads drained per retune (RM-65)
+    int                      settle_reads_ = 2;  ///< reads drained per retune (RM-65)
     std::atomic<bool>        running_{false};
     std::atomic<int>         step_{0};
     std::thread              thread_;
-    std::mutex               wait_mu_;   // dwell wait; stop() notifies
+    std::mutex               wait_mu_;  // dwell wait; stop() notifies
     std::condition_variable  wait_cv_;
-    void loop();
+    void                     loop();
 };
-} // namespace sdr
+}  // namespace sdr
 
 /*
 ========================================================================

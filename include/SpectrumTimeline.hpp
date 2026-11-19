@@ -25,15 +25,18 @@ to determine how to allocate new tasks without conflicts.
 //  Thread-safe. canFit() is read-only (never mutates).
 // ════════════════════════════════════════════════════════════
 #include "sdr/Types.hpp"
-#include <vector>
+
 #include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
-namespace sdr {
+namespace sdr
+{
 
-struct TimeFreqSlot {
+struct TimeFreqSlot
+{
     std::string      task_id;
     int64_t          t_start         = 0;
     int64_t          t_stop          = TIME_INFINITE;
@@ -47,37 +50,40 @@ struct TimeFreqSlot {
     // slice_lo/hi_hz is the RF band the task actually receives (always the
     // requested band — ICD §4.3); budget_* only drives bandwidth bookkeeping.
     // When unset (budget_hi_hz <= budget_lo_hz) the slice doubles as budget.
-    double           budget_lo_hz    = 0.0;
-    double           budget_hi_hz    = 0.0;
+    double budget_lo_hz = 0.0;
+    double budget_hi_hz = 0.0;
     // Exclusive use of the device's tuning group (e.g. a scan that retunes the
     // shared LO every dwell): nothing else may share the LO while it overlaps.
-    bool             exclusive       = false;
+    bool exclusive = false;
 };
 
 // Optional constraints for SpectrumTimeline::canFit().
-struct FitOptions {
-    bool exclusive           = false; ///< Request needs the tuning group to itself (scan).
-    bool allow_channel_reuse = true;  ///< preferred_channel may already be live (fan-out).
+struct FitOptions
+{
+    bool exclusive           = false;  ///< Request needs the tuning group to itself (scan).
+    bool allow_channel_reuse = true;   ///< preferred_channel may already be live (fan-out).
     /// Slots to pretend are absent — used to verify a preemption would help
     /// before anything is cancelled.
     const std::unordered_set<std::string>* ignore = nullptr;
 };
 
-struct FitResult {
-    bool        ok               = false;
-    RejectCode  reject_code      = RejectCode::NO_DEVICE_AVAILABLE;
-    std::string reject_reason;
-    double      device_cf        = 0.0;
-    double      device_rate      = 0.0;
-    double      placed_lo        = 0.0;  ///< Admission budget position (slice packing)
-    double      placed_hi        = 0.0;
-    double      rf_lo            = 0.0;  ///< Requested RF band — what the task receives
-    double      rf_hi            = 0.0;
+struct FitResult
+{
+    bool             ok          = false;
+    RejectCode       reject_code = RejectCode::NO_DEVICE_AVAILABLE;
+    std::string      reject_reason;
+    double           device_cf   = 0.0;
+    double           device_rate = 0.0;
+    double           placed_lo   = 0.0;  ///< Admission budget position (slice packing)
+    double           placed_hi   = 0.0;
+    double           rf_lo       = 0.0;  ///< Requested RF band — what the task receives
+    double           rf_hi       = 0.0;
     std::vector<int> avail_rx;
     std::vector<int> avail_tx;
 };
 
-class SpectrumTimeline {
+class SpectrumTimeline
+{
 public:
     // shared_lo=true  (default): enforce same CF+SR for overlapping tasks and
     //                            pack slices within the shared RF window.
@@ -88,19 +94,25 @@ public:
     // channel may already be in use by another task at the same CF/SR — the
     // scheduler is allowed to reuse it (fan-out / DDC); for independent-LO
     // devices the channel must be free.
-    FitResult canFit(int64_t t_start, int64_t t_stop,
-                     double  cf_hz, double bw_hz, double sr_sps,
-                     int rx_count, int tx_count,
-                     int max_rx, int max_tx,
-                     double guard_hz,
-                     bool shared_lo = true,
-                     int  preferred_channel = -1,
-                     const FitOptions& opts = {}) const;
+    FitResult canFit(int64_t           t_start,
+                     int64_t           t_stop,
+                     double            cf_hz,
+                     double            bw_hz,
+                     double            sr_sps,
+                     int               rx_count,
+                     int               tx_count,
+                     int               max_rx,
+                     int               max_tx,
+                     double            guard_hz,
+                     bool              shared_lo         = true,
+                     int               preferred_channel = -1,
+                     const FitOptions& opts              = {}) const;
 
     // Returns a combined RF window if a new slice at cf_hz/bw_hz can be
     // accommodated by expanding the shared device window to cover both the
     // existing slices and the new request.  Does NOT mutate the timeline.
-    struct CombineResult {
+    struct CombineResult
+    {
         bool             ok           = false;
         double           combined_cf  = 0;
         double           combined_sr  = 0;
@@ -109,22 +121,26 @@ public:
         std::vector<int> avail_rx;
         std::string      reject_reason;
     };
+
     // reuse_channels=false (default): pick the next free RX channels.
     // reuse_channels=true:  ignore channel limits; return existing channels for
     //                       sharing (used by the single-channel multicast path).
-    CombineResult canCombine(int64_t t_start, int64_t t_stop,
-                              double cf_hz, double bw_hz,
-                              int rx_count, int max_rx,
-                              double guard_hz, double sr_max,
-                              bool reuse_channels = false) const;
+    CombineResult canCombine(int64_t t_start,
+                             int64_t t_stop,
+                             double  cf_hz,
+                             double  bw_hz,
+                             int     rx_count,
+                             int     max_rx,
+                             double  guard_hz,
+                             double  sr_max,
+                             bool    reuse_channels = false) const;
 
     // Update center_freq_hz and sample_rate_sps of the slots overlapping
     // [ts, te) — the tasks that share the retuned window. Reservations outside
     // that window keep their own CF/SR (updating every slot used to retarget
     // future reservations at other frequencies — audit RM-63).
     // Without a window (legacy call) every slot is updated.
-    void updateDeviceTune(double new_cf, double new_sr,
-                          int64_t ts = 0, int64_t te = TIME_INFINITE);
+    void updateDeviceTune(double new_cf, double new_sr, int64_t ts = 0, int64_t te = TIME_INFINITE);
     // Move a slot's time window (IMMEDIATE tasks restart their clock when
     // hardware activation finishes).
     void retime(const std::string& task_id, int64_t t_start, int64_t t_stop);
@@ -134,24 +150,30 @@ public:
     void remove(const std::string& task_id);
 
     std::vector<TimeFreqSlot> slotsOverlapping(int64_t ts, int64_t te) const;
-    double allocatedBw(int64_t at_ms)   const;
-    int    usedRx(int64_t at_ms)        const;  ///< Distinct RX channels in use
-    bool   hasExclusive(int64_t ts, int64_t te) const;
-    int    slotCount()                  const;
+    double                    allocatedBw(int64_t at_ms) const;
+    int                       usedRx(int64_t at_ms) const;  ///< Distinct RX channels in use
+    bool                      hasExclusive(int64_t ts, int64_t te) const;
+    int                       slotCount() const;
 
-    struct Window { double cf; double rate; };
+    struct Window
+    {
+        double cf;
+        double rate;
+    };
+
     std::optional<Window> activeWindow(int64_t at_ms) const;
 
 private:
     mutable std::mutex        mu_;
     std::vector<TimeFreqSlot> slots_;
 
-    static bool timeOverlap(int64_t as,int64_t ae,int64_t bs,int64_t be){
-        return (as<be)&&(bs<ae);
+    static bool timeOverlap(int64_t as, int64_t ae, int64_t bs, int64_t be)
+    {
+        return (as < be) && (bs < ae);
     }
 };
 
-} // namespace sdr
+}  // namespace sdr
 
 /*
 ========================================================================

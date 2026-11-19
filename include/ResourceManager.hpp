@@ -30,33 +30,36 @@ Contact author for permission: https://github.com/OpenRFStack
  * - `rt_mu_` — guards live runtime objects (IQStreamers, ScanExecutors, etc.).
  * - `hw_activation_mu_` — serialises SoapySDR open/close across background activation threads.
  */
-#include "sdr/Types.hpp"
 #include "ConfigParser.hpp"
-#include "SpectrumTimeline.hpp"
-#include "UdpPortPool.hpp"
-#include "RadioDevice.hpp"
-#include "IQStreamer.hpp"
-#include "ScanExecutor.hpp"
-#include "TriggerMonitor.hpp"
 #include "FftEngine.hpp"
-#include <string>
+#include "IQStreamer.hpp"
+#include "RadioDevice.hpp"
+#include "ScanExecutor.hpp"
+#include "SpectrumTimeline.hpp"
+#include "TriggerMonitor.hpp"
+#include "UdpPortPool.hpp"
+#include "sdr/Types.hpp"
+
+#include <atomic>
+#include <chrono>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <unordered_map>
 #include <vector>
-#include <functional>
-#include <chrono>
-#include <atomic>
-#include <optional>
 
-namespace sdr {
+namespace sdr
+{
 
 /**
  * @brief Schedules and activates SDR tasks across a pool of RadioDevices.
  *
  * Non-copyable.  Created by Controller; all methods are thread-safe.
  */
-class ResourceManager {
+class ResourceManager
+{
 public:
     /**
      * @brief Construct the resource manager.
@@ -64,19 +67,19 @@ public:
      * @param on_state_change  Callback fired on every task state transition.
      * @param on_error         Callback fired on unrecoverable task errors.
      */
-    explicit ResourceManager(const AppConfig& cfg,
+    explicit ResourceManager(const AppConfig&   cfg,
                              TaskStateChangedCb on_state_change,
                              TaskErrorCb        on_error);
     ~ResourceManager();
 
-    ResourceManager(const ResourceManager&)=delete;
-    ResourceManager& operator=(const ResourceManager&)=delete;
+    ResourceManager(const ResourceManager&)            = delete;
+    ResourceManager& operator=(const ResourceManager&) = delete;
 
     /**
      * @brief Open all devices listed in the configuration.
      * @return Number of devices that opened successfully.
      */
-    int  openDevices();
+    int openDevices();
     /// @brief Close all open devices (called at shutdown).
     void closeDevices();
 
@@ -102,8 +105,8 @@ public:
      * @param reason     Human-readable stop reason.
      * @return TaskResponse indicating success or failure (e.g. TASK_NOT_FOUND).
      */
-    TaskResponse stopTask(const std::string& task_id, const std::string& request_id,
-                          const std::string& reason);
+    TaskResponse
+    stopTask(const std::string& task_id, const std::string& request_id, const std::string& reason);
 
     /**
      * @brief Cancel a task immediately (including SCHEDULED tasks).
@@ -112,7 +115,8 @@ public:
      * @param reason     Human-readable cancel reason.
      * @return TaskResponse indicating success or failure.
      */
-    TaskResponse cancelTask(const std::string& task_id, const std::string& request_id,
+    TaskResponse cancelTask(const std::string& task_id,
+                            const std::string& request_id,
                             const std::string& reason);
 
     // ── Controller thread helpers ───────────────────────────────────────────
@@ -125,37 +129,46 @@ public:
     // ── Queries ────────────────────────────────────────────────────────────
 
     /// @brief Return all tasks in non-terminal states.
-    std::vector<TaskRecord>   getActiveTasks() const;
+    std::vector<TaskRecord> getActiveTasks() const;
     /// @brief Count tasks in state @p s.
-    int  countByState(TaskState s) const;
+    int countByState(TaskState s) const;
     /// @brief Return all configured device IDs.
-    std::vector<std::string>  deviceIds() const;
+    std::vector<std::string> deviceIds() const;
     /// @brief Pointer to a device by ID; nullptr if not found.
-    RadioDevice*              getDevice(const std::string& id);
+    RadioDevice* getDevice(const std::string& id);
 
     /// @brief Summary of one device for health responses.
-    struct DeviceSummary {
+    struct DeviceSummary
+    {
         std::string device_id, driver, uri, coherency_group;
-        bool   online      = false;
-        int    active_tasks = 0;
-        double cf_hz       = 0;  ///< Current LO frequency (Hz).
-        double rate_sps    = 0;  ///< Current sample rate (samples/s).
-        double alloc_bw_hz = 0;  ///< Allocated bandwidth (Hz).
-        double free_bw_hz  = 0;  ///< Free bandwidth (Hz).
-        double temp_c      = 0;  ///< Last temperature reading (°C).
+        bool        online       = false;
+        int         active_tasks = 0;
+        double      cf_hz        = 0;  ///< Current LO frequency (Hz).
+        double      rate_sps     = 0;  ///< Current sample rate (samples/s).
+        double      alloc_bw_hz  = 0;  ///< Allocated bandwidth (Hz).
+        double      free_bw_hz   = 0;  ///< Free bandwidth (Hz).
+        double      temp_c       = 0;  ///< Last temperature reading (°C).
     };
+
     /// @brief Snapshot of all device summaries for a HEALTH_QUERY_RESPONSE.
     std::vector<DeviceSummary> deviceSummaries() const;
 
-    int udpPortsUsed() const { return port_pool_->usedCount(); }
-    int udpPortsFree() const { return port_pool_->freeCount(); }
+    int udpPortsUsed() const
+    {
+        return port_pool_->usedCount();
+    }
+
+    int udpPortsFree() const
+    {
+        return port_pool_->freeCount();
+    }
 
 private:
-    AppConfig         cfg_;
+    AppConfig          cfg_;
     TaskStateChangedCb on_state_change_;
     TaskErrorCb        on_error_;
 
-    std::unordered_map<std::string, std::unique_ptr<RadioDevice>>     devices_;
+    std::unordered_map<std::string, std::unique_ptr<RadioDevice>>      devices_;
     std::unordered_map<std::string, std::unique_ptr<SpectrumTimeline>> timelines_;
     /// Device ids in devices.xml order. Every device scan iterates this, so
     /// allocation (and the stream order in coherent responses) is deterministic
@@ -165,13 +178,19 @@ private:
     std::unique_ptr<UdpPortPool> port_pool_;
     std::unique_ptr<FftEngine>   fft_engine_;
 
-    mutable std::mutex                             reg_mu_;
-    std::unordered_map<std::string, TaskRecord>    registry_;
+    mutable std::mutex                          reg_mu_;
+    std::unordered_map<std::string, TaskRecord> registry_;
     /// When each terminal task became terminal (guarded by reg_mu_).
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> terminal_since_;
+
     /// Per-request RX gain overrides (rf.rx_gain_db / rf.rx_agc), by task id.
-    struct GainRequest { std::vector<double> gain_db; std::vector<bool> agc; };
-    std::unordered_map<std::string, GainRequest> task_gains_;   // guarded by reg_mu_
+    struct GainRequest
+    {
+        std::vector<double> gain_db;
+        std::vector<bool>   agc;
+    };
+
+    std::unordered_map<std::string, GainRequest> task_gains_;  // guarded by reg_mu_
     /// Serialises state-change callbacks (keeps TASK_STATUS ordered) without
     /// holding reg_mu_ while the callback runs.
     std::mutex notify_mu_;
@@ -180,25 +199,29 @@ private:
     std::mutex accept_mu_;
 
     /// Per-channel hardware state shared by all tasks multicast from the same channel.
-    struct ChannelState {
-        RadioDevice*               device       = nullptr;
-        SoapySDR::Stream*          soapy_stream = nullptr;
+    struct ChannelState
+    {
+        RadioDevice*                device       = nullptr;
+        SoapySDR::Stream*           soapy_stream = nullptr;
         std::shared_ptr<IQStreamer> streamer;
     };
-    std::unordered_map<std::string, ChannelState> channel_states_; // key="dev_id:ch"
+
+    std::unordered_map<std::string, ChannelState> channel_states_;  // key="dev_id:ch"
 
     /// Live runtime objects for one active task.
-    struct TaskRuntime {
+    struct TaskRuntime
+    {
         std::vector<std::pair<RadioDevice*, SoapySDR::Stream*>> soapy_streams;
-        RadioDevice*                             device = nullptr;
-        std::vector<std::shared_ptr<IQStreamer>> streamers;
-        std::unique_ptr<ScanExecutor>            scan_exec;
-        std::unique_ptr<TriggerMonitor>          trig_mon;
-        bool                                     is_subband_consumer = false;
-        IQStreamer::Clock::time_point            epoch{};   ///< task time base
+        RadioDevice*                                            device = nullptr;
+        std::vector<std::shared_ptr<IQStreamer>>                streamers;
+        std::unique_ptr<ScanExecutor>                           scan_exec;
+        std::unique_ptr<TriggerMonitor>                         trig_mon;
+        bool                                                    is_subband_consumer = false;
+        IQStreamer::Clock::time_point                           epoch{};  ///< task time base
     };
-    mutable std::mutex                              rt_mu_;
-    std::unordered_map<std::string, TaskRuntime>    runtimes_;
+
+    mutable std::mutex                           rt_mu_;
+    std::unordered_map<std::string, TaskRuntime> runtimes_;
 
     /// Serialises SoapySDR open and close calls (tune/openRxStream/activateStream/
     /// deactivateStream/closeStream) across background activation/deactivation
@@ -222,66 +245,95 @@ private:
     TaskResponse doAcceptSnapshot(const TaskRequest& req, SnapshotResult* out);
     TaskResponse doAcceptCalibration(const TaskRequest& req);
 
-    struct DeviceCandidate { RadioDevice* device; FitResult fit; };
+    struct DeviceCandidate
+    {
+        RadioDevice* device;
+        FitResult    fit;
+    };
+
     using DeviceFilter = std::function<bool(const RadioDevice&)>;
-    std::optional<DeviceCandidate>
-        findBestDevice(double cf, double bw, double sr,
-                       int rx_count, int tx_count,
-                       int64_t t_start, int64_t t_stop,
-                       const std::string& preferred,
-                       int preferred_channel = -1,
-                       bool device_required  = false,
-                       const FitOptions& opts = {},
-                       const DeviceFilter& extra_ok = nullptr,
-                       std::string* why = nullptr) const;
+    std::optional<DeviceCandidate> findBestDevice(double              cf,
+                                                  double              bw,
+                                                  double              sr,
+                                                  int                 rx_count,
+                                                  int                 tx_count,
+                                                  int64_t             t_start,
+                                                  int64_t             t_stop,
+                                                  const std::string&  preferred,
+                                                  int                 preferred_channel = -1,
+                                                  bool                device_required   = false,
+                                                  const FitOptions&   opts              = {},
+                                                  const DeviceFilter& extra_ok          = nullptr,
+                                                  std::string*        why = nullptr) const;
     /// Hardware rate needed to deliver `sr` on this device (fixed rate or
     /// sub-floor multiple; the DDC bridges the difference), or nullopt.
     std::optional<double> acquisitionRate(const RadioDevice& dev, double sr) const;
-    bool deviceCanServe(const RadioDevice& dev, double cf, double bw, double sr,
-                        int rx, int tx) const;
+    bool
+    deviceCanServe(const RadioDevice& dev, double cf, double bw, double sr, int rx, int tx) const;
     /// Reserve `n` UDP ports, honouring client pre-bound dest_ports first.
     /// pool_ports receives the ports taken from the pool (to release on reject).
-    bool reservePorts(const std::vector<int>& client_ports, int n,
-                      std::vector<int>& ports, std::vector<int>& pool_ports);
-    TaskResponse acceptCoherent(const TaskRequest& req, TaskResponse resp,
-                                int64_t t_start, int64_t t_stop, const FitOptions& opts,
+    bool         reservePorts(const std::vector<int>& client_ports,
+                              int                     n,
+                              std::vector<int>&       ports,
+                              std::vector<int>&       pool_ports);
+    TaskResponse acceptCoherent(const TaskRequest&  req,
+                                TaskResponse        resp,
+                                int64_t             t_start,
+                                int64_t             t_stop,
+                                const FitOptions&   opts,
                                 const DeviceFilter& extra_ok);
-    TaskRecord newRecord(const TaskRequest& req, const std::string& task_id,
-                         int64_t t_start, int64_t t_stop,
-                         std::vector<TaskRecord::DeviceAllocation> allocs) const;
-    void commitTask(TaskRecord rec, const RfRequest& rf);
-    void pruneTerminalTasks();
+    TaskRecord   newRecord(const TaskRequest&                        req,
+                           const std::string&                        task_id,
+                           int64_t                                   t_start,
+                           int64_t                                   t_stop,
+                           std::vector<TaskRecord::DeviceAllocation> allocs) const;
+    void         commitTask(TaskRecord rec, const RfRequest& rf);
+    void         pruneTerminalTasks();
 
     void activateTask(const std::string& task_id);
-    void deactivateTask(const std::string& task_id, TaskState terminal_state,
-                        const std::string& reason);
+    void
+    deactivateTask(const std::string& task_id, TaskState terminal_state, const std::string& reason);
     void notifyStateChange(const std::string& task_id);
 
     /// Preemption plan: lower-rank tasks whose removal provably makes room.
-    struct PreemptPlan { std::string device_id; std::vector<std::string> victims; };
-    std::optional<PreemptPlan> planPreemption(const TaskRequest& req, int64_t t_start,
-                                              int64_t t_stop, const FitOptions& opts) const;
+    struct PreemptPlan
+    {
+        std::string              device_id;
+        std::vector<std::string> victims;
+    };
+
+    std::optional<PreemptPlan> planPreemption(const TaskRequest& req,
+                                              int64_t            t_start,
+                                              int64_t            t_stop,
+                                              const FitOptions&  opts) const;
     void applyPreemption(const PreemptPlan& plan, int rank, const std::string& request_id);
+
     /// Combined-window plan; applyCombined() performs the retune. Planning has
     /// no side effects, so a request rejected later leaves hardware untouched.
-    struct CombinePlan {
+    struct CombinePlan
+    {
         DeviceCandidate cand;
-        double old_cf = 0, old_sr = 0;
-        bool   hw_changed = false;
+        double          old_cf = 0, old_sr = 0;
+        bool            hw_changed = false;
     };
-    std::optional<CombinePlan> planCombined(const TaskRequest& req, int64_t t_start, int64_t t_stop) const;
+
+    std::optional<CombinePlan>
+         planCombined(const TaskRequest& req, int64_t t_start, int64_t t_stop) const;
     bool applyCombined(const CombinePlan& plan, int64_t t_start, int64_t t_stop);
 
-    std::string makeStreamId(const std::string& task_id, const std::string& type,
-                             const std::string& dev_id, int ch_idx) const;
+    std::string makeStreamId(const std::string& task_id,
+                             const std::string& type,
+                             const std::string& dev_id,
+                             int                ch_idx) const;
 
-    static int64_t nowMs() {
+    static int64_t nowMs()
+    {
         using namespace std::chrono;
         return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
     }
 };
 
-} // namespace sdr
+}  // namespace sdr
 
 /*
 ========================================================================

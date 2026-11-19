@@ -11,33 +11,57 @@ Contact author for permission: https://github.com/OpenRFStack
 ========================================================================
 */
 #include "TriggerMonitor.hpp"
+
 #include "IQStreamer.hpp"
-#include <spdlog/spdlog.h>
+
 #include <SoapySDR/Errors.hpp>
-#include <cmath>
+#include <spdlog/spdlog.h>
+
 #include <chrono>
+#include <cmath>
 #include <thread>
 
-namespace sdr {
+namespace sdr
+{
 using namespace std::chrono;
 
-TriggerMonitor::TriggerMonitor(const std::string& id, const TriggerParams& p,
-    SoapySDR::Device* dev, SoapySDR::Stream* stream,
-    IQStreamer* s, double rate, DoneCb done, std::vector<IQStreamer*> also_start)
-    : task_id_(id), params_(p), dev_(dev), stream_(stream),
-      streamer_(s), also_(std::move(also_start)), rate_(rate), done_(std::move(done)) {}
+TriggerMonitor::TriggerMonitor(const std::string&       id,
+                               const TriggerParams&     p,
+                               SoapySDR::Device*        dev,
+                               SoapySDR::Stream*        stream,
+                               IQStreamer*              s,
+                               double                   rate,
+                               DoneCb                   done,
+                               std::vector<IQStreamer*> also_start)
+    : task_id_(id)
+    , params_(p)
+    , dev_(dev)
+    , stream_(stream)
+    , streamer_(s)
+    , also_(std::move(also_start))
+    , rate_(rate)
+    , done_(std::move(done))
+{
+}
 
-TriggerMonitor::~TriggerMonitor() { stop(); }
+TriggerMonitor::~TriggerMonitor()
+{
+    stop();
+}
 
-void TriggerMonitor::start() {
-    if (running_.exchange(true)) return;
+void TriggerMonitor::start()
+{
+    if (running_.exchange(true))
+        return;
     thread_ = std::thread(&TriggerMonitor::loop, this);
     spdlog::info("TriggerMonitor [{}] started thr={:.1f}dBFS", task_id_, params_.threshold_dbfs);
 }
 
-void TriggerMonitor::stop() {
+void TriggerMonitor::stop()
+{
     running_.store(false);
-    if (!thread_.joinable()) return;
+    if (!thread_.joinable())
+        return;
     // done_() fires from loop() which runs on thread_ — joining from the same
     // thread is UB; detach so the thread cleans up on its own (same pattern
     // as ScanExecutor::stop()).
@@ -47,29 +71,37 @@ void TriggerMonitor::stop() {
         thread_.join();
 }
 
-float TriggerMonitor::rmsDbfs(const float* b, int n) {
-    float sq=0;
-    for (int i=0;i<n*2;++i) sq+=b[i]*b[i];
-    return 10.f*std::log10(sq/(float)n+1e-30f);
+float TriggerMonitor::rmsDbfs(const float* b, int n)
+{
+    float sq = 0;
+    for (int i = 0; i < n * 2; ++i)
+        sq += b[i] * b[i];
+    return 10.f * std::log10(sq / (float)n + 1e-30f);
 }
 
-void TriggerMonitor::loop() {
-    std::vector<float> buf((size_t)BLK*2);
-    void* bufs[1]={buf.data()};
-    int flags=0; long long hw_ts=0;
-    int caps_done=0;
-    int consecutive_errors=0;
-    bool ok=true;
+void TriggerMonitor::loop()
+{
+    std::vector<float> buf((size_t)BLK * 2);
+    void*              bufs[1]            = {buf.data()};
+    int                flags              = 0;
+    long long          hw_ts              = 0;
+    int                caps_done          = 0;
+    int                consecutive_errors = 0;
+    bool               ok                 = true;
 
-    while (running_.load()) {
+    while (running_.load())
+    {
         // Detection phase: read stream in this thread looking for threshold crossing.
-        int ret=dev_->readStream(stream_, bufs, (size_t)BLK, flags, hw_ts, 200'000LL);
-        if (ret==SOAPY_SDR_TIMEOUT) continue;
-        if (ret<0) {
+        int ret = dev_->readStream(stream_, bufs, (size_t)BLK, flags, hw_ts, 200'000LL);
+        if (ret == SOAPY_SDR_TIMEOUT)
+            continue;
+        if (ret < 0)
+        {
             // Errors that return immediately used to make this a 100% CPU spin.
-            if (ret != SOAPY_SDR_OVERFLOW && ++consecutive_errors >= 50) {
-                spdlog::error("TriggerMonitor [{}] stream keeps failing ({}) — giving up",
-                              task_id_, ret);
+            if (ret != SOAPY_SDR_OVERFLOW && ++consecutive_errors >= 50)
+            {
+                spdlog::error(
+                    "TriggerMonitor [{}] stream keeps failing ({}) — giving up", task_id_, ret);
                 ok = false;
                 break;
             }
@@ -77,17 +109,21 @@ void TriggerMonitor::loop() {
             continue;
         }
         consecutive_errors = 0;
-        int n=std::min(ret,BLK);
-        float rms=rmsDbfs(buf.data(),n);
-        if (rms < params_.threshold_dbfs) continue;
+        int   n            = std::min(ret, BLK);
+        float rms          = rmsDbfs(buf.data(), n);
+        if (rms < params_.threshold_dbfs)
+            continue;
 
         spdlog::info("TriggerMonitor [{}] TRIGGERED {:.1f}dBFS", task_id_, rms);
 
         // Hand off to IQStreamer: stop reading from stream so IQStreamer's
         // workerLoop is the sole reader (two concurrent readStream callers on the
         // same SoapySDR::Stream are not safe and would race for packets).
-        if (streamer_ && !streamer_->isRunning()) streamer_->start();
-        for (auto* o : also_) if (o && !o->isRunning()) o->start();
+        if (streamer_ && !streamer_->isRunning())
+            streamer_->start();
+        for (auto* o : also_)
+            if (o && !o->isRunning())
+                o->start();
 
         // Wait post_trigger_ms via sleep rather than by counting samples —
         // the stream is owned by IQStreamer during this window.
@@ -95,15 +131,21 @@ void TriggerMonitor::loop() {
         while (running_.load() && steady_clock::now() < post_end)
             std::this_thread::sleep_for(milliseconds(10));
 
-        if (streamer_ && streamer_->isRunning()) streamer_->stop();
-        for (auto* o : also_) if (o && o->isRunning()) o->stop();
-        ++caps_done; captures_.store(caps_done);
+        if (streamer_ && streamer_->isRunning())
+            streamer_->stop();
+        for (auto* o : also_)
+            if (o && o->isRunning())
+                o->stop();
+        ++caps_done;
+        captures_.store(caps_done);
         spdlog::info("TriggerMonitor [{}] capture #{} done", task_id_, caps_done);
-        if (params_.max_captures>0 && caps_done>=params_.max_captures) break;
+        if (params_.max_captures > 0 && caps_done >= params_.max_captures)
+            break;
     }
-    if(done_) done_(task_id_,ok);
+    if (done_)
+        done_(task_id_, ok);
 }
-} // namespace sdr
+}  // namespace sdr
 
 /*
 ========================================================================

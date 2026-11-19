@@ -28,23 +28,26 @@ Contact author for permission: https://github.com/OpenRFStack
  * ctrl.run();   // blocks until stop() is called (e.g. SIGTERM handler)
  * ```
  */
+#include "AmqpClient.hpp"
 #include "ConfigParser.hpp"
 #include "ResourceManager.hpp"
-#include "AmqpClient.hpp"
 #include "sdr/MessageCodec.hpp"
-#include <memory>
-#include <thread>
+
 #include <atomic>
 #include <chrono>
+#include <memory>
+#include <thread>
 
-namespace sdr {
+namespace sdr
+{
 
 /**
  * @brief Top-level controller: AMQP dispatcher + scheduler + watchdog.
  *
  * Non-copyable.  Exactly one instance per process.
  */
-class Controller {
+class Controller
+{
 public:
     /**
      * @brief Construct the controller.
@@ -52,8 +55,8 @@ public:
      */
     explicit Controller(const AppConfig& cfg);
     ~Controller();
-    Controller(const Controller&)=delete;
-    Controller& operator=(const Controller&)=delete;
+    Controller(const Controller&)            = delete;
+    Controller& operator=(const Controller&) = delete;
 
     /**
      * @brief Open all devices, connect to AMQP, and run until stop().
@@ -67,19 +70,25 @@ public:
     void stop();
 
 private:
-    AppConfig                      cfg_;
+    AppConfig                        cfg_;
     std::unique_ptr<ResourceManager> rm_;
     std::unique_ptr<AmqpClient>      amqp_;
 
-    std::atomic<bool>  running_{false};
-    std::thread        scheduler_thread_;  ///< Calls rm_->schedulerTick() periodically.
-    std::thread        watchdog_thread_;   ///< Calls rm_->watchdogTick() periodically.
-    std::thread        heartbeat_thread_;  ///< Publishes TASK_STATUS heartbeats.
+    std::atomic<bool> running_{false};
+    std::thread       scheduler_thread_;  ///< Calls rm_->schedulerTick() periodically.
+    std::thread       watchdog_thread_;   ///< Calls rm_->watchdogTick() periodically.
+    std::thread       heartbeat_thread_;  ///< Publishes TASK_STATUS heartbeats.
 
-    std::mutex               snapshot_mu_;
+    std::mutex snapshot_mu_;
+
     /// In-flight snapshot threads. Finished ones are joined when the next
     /// snapshot arrives (they used to accumulate until stop() — CTRL-01).
-    struct SnapshotThread { std::thread t; std::shared_ptr<std::atomic<bool>> done; };
+    struct SnapshotThread
+    {
+        std::thread                        t;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+
     std::vector<SnapshotThread> snapshot_threads_;
 
     std::chrono::steady_clock::time_point start_time_;
@@ -101,18 +110,20 @@ private:
     bool sleepResponsive(int total_ms);
 
     void handleTaskRequest(const TaskRequest& req, const std::string& reply_to);
-    void handleTaskStop(const TaskRequest& req,    const std::string& reply_to);
-    void handleTaskCancel(const TaskRequest& req,  const std::string& reply_to);
+    void handleTaskStop(const TaskRequest& req, const std::string& reply_to);
+    void handleTaskCancel(const TaskRequest& req, const std::string& reply_to);
     void handleHealthQuery(const TaskRequest& req, const std::string& reply_to);
     void handleSnapshotRequest(const TaskRequest& req, const std::string& reply_to);
-    void handleTempQuery(const TaskRequest& req,   const std::string& reply_to);
+    void handleTempQuery(const TaskRequest& req, const std::string& reply_to);
 
-    void sendReject(const std::string& req_id, const std::string& corr_id,
-                    RejectCode code, const std::string& reason,
+    void sendReject(const std::string& req_id,
+                    const std::string& corr_id,
+                    RejectCode         code,
+                    const std::string& reason,
                     const std::string& reply_to = "");
 };
 
-} // namespace sdr
+}  // namespace sdr
 
 /*
 ========================================================================

@@ -27,21 +27,25 @@ Contact author for permission: https://github.com/OpenRFStack
  */
 #include "ConfigParser.hpp"
 #include "sdr/Types.hpp"
+
 #include <SoapySDR/Device.hpp>
+
 #include <atomic>
 #include <mutex>
 #include <set>
 #include <string>
 #include <vector>
 
-namespace sdr {
+namespace sdr
+{
 
 /**
  * @brief Thin wrapper around one SoapySDR device.
  *
  * Non-copyable.  Created by ResourceManager::openDevices().
  */
-class RadioDevice {
+class RadioDevice
+{
 public:
     /**
      * @brief Construct without opening the device.
@@ -49,8 +53,8 @@ public:
      */
     explicit RadioDevice(const DeviceConfig& cfg);
     ~RadioDevice();
-    RadioDevice(const RadioDevice&)=delete;
-    RadioDevice& operator=(const RadioDevice&)=delete;
+    RadioDevice(const RadioDevice&)            = delete;
+    RadioDevice& operator=(const RadioDevice&) = delete;
 
     /**
      * @brief Open the SoapySDR device (calls SoapySDR::Device::make()).
@@ -61,13 +65,32 @@ public:
     void close();
 
     /// @brief True while the device is open and usable.
-    bool isOnline() const { return online_.load(std::memory_order_acquire); }
-    /// @brief Raw SoapySDR device pointer — valid only while isOnline().
-    SoapySDR::Device* soapyDevice() const { std::lock_guard l(mu_); return dev_; }
+    bool isOnline() const
+    {
+        return online_.load(std::memory_order_acquire);
+    }
 
-    const std::string&   id()     const { return cfg_.id; }
-    const std::string&   group()  const { return cfg_.coherency_group; }
-    const DeviceConfig&  config() const { return cfg_; }
+    /// @brief Raw SoapySDR device pointer — valid only while isOnline().
+    SoapySDR::Device* soapyDevice() const
+    {
+        std::lock_guard l(mu_);
+        return dev_;
+    }
+
+    const std::string& id() const
+    {
+        return cfg_.id;
+    }
+
+    const std::string& group() const
+    {
+        return cfg_.coherency_group;
+    }
+
+    const DeviceConfig& config() const
+    {
+        return cfg_;
+    }
 
     /**
      * @brief Tune all channels to @p cf_hz at @p sr_sps (shared_lo devices).
@@ -109,9 +132,9 @@ public:
      * @return Stream handle; nullptr on failure.
      */
     SoapySDR::Stream* openRxStream(const std::vector<int>& channels);
-    bool  activateStream(SoapySDR::Stream* s);
-    void  deactivateStream(SoapySDR::Stream* s);
-    void  closeStream(SoapySDR::Stream* s);
+    bool              activateStream(SoapySDR::Stream* s);
+    void              deactivateStream(SoapySDR::Stream* s);
+    void              closeStream(SoapySDR::Stream* s);
 
     /**
      * @brief Direct synchronous stream read (used by the snapshot path).
@@ -126,14 +149,22 @@ public:
      * @param timeoutUs Read timeout (microseconds).
      * @return Number of samples read, or negative error code.
      */
-    int   readStream(SoapySDR::Stream* s, void** buffs, size_t numElems,
-                     int& flags, long long& timeNs, long timeoutUs = 500'000LL);
+    int readStream(SoapySDR::Stream* s,
+                   void**            buffs,
+                   size_t            numElems,
+                   int&              flags,
+                   long long&        timeNs,
+                   long              timeoutUs = 500'000LL);
 
     /// @brief Read the primary temperature sensor (°C).  Returns NaN on failure.
     double getTemperature() const;
 
     /// @brief One temperature sensor reading.
-    struct TempSensor { std::string name; double value_c = 0.0; };
+    struct TempSensor
+    {
+        std::string name;
+        double      value_c = 0.0;
+    };
 
     /**
      * @brief Enumerate all temperature sensors exposed by the device.
@@ -146,17 +177,19 @@ public:
      */
     std::vector<TempSensor> listTemperatures() const;
 
-    double currentCF()   const;  ///< Last tuned centre frequency (Hz).
+    double currentCF() const;    ///< Last tuned centre frequency (Hz).
     double currentRate() const;  ///< Last set sample rate (samples/s).
 
     /// @brief Snapshot of device status for health reporting.
-    struct Status {
+    struct Status
+    {
         std::string device_id, driver, uri, coherency_group;
-        bool   online         = false;
-        double center_freq_hz = 0.0;
-        double sample_rate    = 0.0;
-        double temperature_c  = 0.0;
+        bool        online         = false;
+        double      center_freq_hz = 0.0;
+        double      sample_rate    = 0.0;
+        double      temperature_c  = 0.0;
     };
+
     /// @brief Return a status snapshot (safe to call from any thread).
     Status getStatus() const;
 
@@ -172,13 +205,13 @@ public:
     bool reopen();
 
 private:
-    DeviceConfig      cfg_;
-    SoapySDR::Device* dev_    = nullptr;
-    std::atomic<bool> online_ {false};
+    DeviceConfig       cfg_;
+    SoapySDR::Device*  dev_ = nullptr;
+    std::atomic<bool>  online_{false};
     mutable std::mutex mu_;
-    double current_cf_   = 0.0;
-    double current_rate_ = 0.0;
-    int consecutive_stream_failures_ = 0;
+    double             current_cf_                  = 0.0;
+    double             current_rate_                = 0.0;
+    int                consecutive_stream_failures_ = 0;
     /// Streams set up and not yet closed. reopen() unmakes dev_, which every
     /// IQStreamer / TriggerMonitor on this device holds a raw pointer to — it
     /// must never happen while one is open (RM-69).
@@ -188,12 +221,12 @@ private:
     // when devices.xml leaves <uri> empty, so a second RadioDevice instance
     // of the same driver doesn't grab the same physical unit. Empty when
     // this device was opened with an explicit uri instead of discovery.
-    std::string claimed_key_;
+    std::string                   claimed_key_;
     static std::mutex&            claimMutex();
     static std::set<std::string>& claimedUris();
 };
 
-} // namespace sdr
+}  // namespace sdr
 
 /*
 ========================================================================

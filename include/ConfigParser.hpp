@@ -21,20 +21,22 @@ PolicyConfig structs. Based on tinyxml2.
 #include <string>
 #include <vector>
 
-namespace sdr {
+namespace sdr
+{
 
 // Per-device RF capability envelope. All fields are read from <capabilities>
 // in devices.xml; the defaults below are used only when a field is absent from
 // the XML.  They are intentionally set to cover a wide range so that an
 // incomplete config still works — do NOT treat them as global hard limits.
 // Override every field to match your actual hardware.
-struct DeviceCapabilities {
-    int    rx_channels         = 2;         // AD9361/LimeSDR MIMO default
+struct DeviceCapabilities
+{
+    int    rx_channels         = 2;  // AD9361/LimeSDR MIMO default
     int    tx_channels         = 2;
-    double freq_min_hz         = 70e6;      // AD9361 lower bound; RTL-SDR is 24 MHz, HackRF 1 MHz
-    double freq_max_hz         = 6e9;       // AD9361/HackRF upper bound
-    double bandwidth_max_hz    = 56e6;      // AD9361; LimeSDR goes to 130 MHz
-    double sample_rate_max_sps = 61.44e6;   // AD9361; LimeSDR/USRP N-series go higher
+    double freq_min_hz         = 70e6;     // AD9361 lower bound; RTL-SDR is 24 MHz, HackRF 1 MHz
+    double freq_max_hz         = 6e9;      // AD9361/HackRF upper bound
+    double bandwidth_max_hz    = 56e6;     // AD9361; LimeSDR goes to 130 MHz
+    double sample_rate_max_sps = 61.44e6;  // AD9361; LimeSDR/USRP N-series go higher
     // Lowest rate the hardware ADC/driver can actually be set to (0 = no known
     // floor). Many SDRs reject low rates that digital-protocol/narrowband demod
     // tasks request (e.g. RTL-SDR's RTL2832U rejects anything below ~225,001 Hz).
@@ -50,7 +52,8 @@ struct DeviceCapabilities {
     double tx_atten_max_db     = 89.0;
 };
 
-struct DeviceConfig {
+struct DeviceConfig
+{
     std::string        id;
     std::string        driver;
     std::string        uri;
@@ -79,11 +82,12 @@ struct DeviceConfig {
     //         strength (field/mobile/recon deployments).
     // false = fixed manual gain at rx_gain_db (default — repeatable,
     //         deterministic for fixed-site/lab use).
-    bool   rx_agc      = false;
-    double rx_gain_db  = 30.0;
+    bool   rx_agc     = false;
+    double rx_gain_db = 30.0;
 };
 
-struct BrokerConfig {
+struct BrokerConfig
+{
     std::string url                        = "amqp://localhost:5672";
     std::string username                   = "guest";
     std::string password                   = "guest";
@@ -96,38 +100,45 @@ struct BrokerConfig {
     int         send_queue_depth           = 512;
 };
 
-enum class RetuneConflictPolicy { REJECT_NEW, CANCEL_LOWER };
+enum class RetuneConflictPolicy
+{
+    REJECT_NEW,
+    CANCEL_LOWER
+};
 
-struct PolicyConfig {
+struct PolicyConfig
+{
     int                  max_concurrent_tasks    = 64;
     double               guard_band_hz           = 200e3;
     double               usable_bw_fraction      = 0.80;
     int64_t              default_task_timeout_ms = 3'600'000LL;
-    int                  scheduler_tick_ms        = 200;
-    int                  watchdog_tick_ms         = 1000;
-    int                  udp_port_pool_start      = 30000;
-    int                  udp_port_pool_end        = 31999;
-    int                  iq_packet_samples        = 1024;
-    RetuneConflictPolicy retune_conflict_policy   = RetuneConflictPolicy::REJECT_NEW;
-    int                  heartbeat_interval_ms    = 30000;
+    int                  scheduler_tick_ms       = 200;
+    int                  watchdog_tick_ms        = 1000;
+    int                  udp_port_pool_start     = 30'000;
+    int                  udp_port_pool_end       = 31'999;
+    int                  iq_packet_samples       = 1024;
+    RetuneConflictPolicy retune_conflict_policy  = RetuneConflictPolicy::REJECT_NEW;
+    int                  heartbeat_interval_ms   = 30'000;
     // Terminal task records are kept for STOP/CANCEL replies and status
     // queries, then pruned (the registry used to grow forever — audit RM-38).
-    int64_t              terminal_task_retention_ms = 600'000;
-    int                  max_terminal_tasks         = 1000;
+    int64_t terminal_task_retention_ms = 600'000;
+    int     max_terminal_tasks         = 1000;
 };
 
-struct AppConfig {
+struct AppConfig
+{
     BrokerConfig              broker;
     PolicyConfig              policy;
     std::vector<DeviceConfig> devices;
 };
 
-class ConfigParser {
+class ConfigParser
+{
 public:
     static AppConfig parse(const std::string& xml_path);
 };
 
-} // namespace sdr
+}  // namespace sdr
 
 /*
 ========================================================================
