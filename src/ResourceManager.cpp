@@ -104,6 +104,7 @@ int ResourceManager::openDevices()
         if (dev->open())
         {
             ++ok;
+            dev->refreshSensors();
             spdlog::info("ResourceManager: opened {}", id);
         }
         else
@@ -445,7 +446,55 @@ ResourceManager::findBestDevice(double              cf,
 }
 
 // ── tryAccept entry point ────────────────────────────────────────────────
+namespace
+{
+// Rejections that a resource still being released could have caused.
+bool resourceBusy(RejectCode c)
+{
+    switch (c)
+    {
+        case RejectCode::CHANNEL_COUNT_EXCEEDED:
+        case RejectCode::SPECTRUM_CONFLICT:
+        case RejectCode::TIME_CONFLICT:
+        case RejectCode::RETUNE_CONFLICT:
+        case RejectCode::NO_DEVICE_AVAILABLE:
+        case RejectCode::COHERENCY_UNAVAILABLE:
+        case RejectCode::TASK_LIMIT_REACHED:
+        case RejectCode::PORT_POOL_EXHAUSTED:
+            return true;
+        default:
+            return false;
+    }
+}
+}  // namespace
+
+bool ResourceManager::waitForTeardowns(std::chrono::milliseconds timeout)
+{
+    std::unique_lock lk(teardown_mu_);
+    if (teardowns_in_flight_.load(std::memory_order_relaxed) == 0)
+        return false;
+    return teardown_cv_.wait_for(lk,
+                                 timeout,
+                                 [this]
+                                 {
+                                     return teardowns_in_flight_.load(std::memory_order_relaxed)
+                                            == 0;
+                                 });
+}
+
 TaskResponse ResourceManager::tryAccept(const TaskRequest& req, SnapshotResult* snapshot_out)
+{
+    auto resp = tryAcceptOnce(req, snapshot_out);
+    // A stop/cancel answered just before this request may still be releasing
+    // the channels it wants (teardown is asynchronous, RM-17): wait for it
+    // (bounded) instead of rejecting, then decide again.
+    if (!resp.accepted && resourceBusy(resp.reject_code)
+        && waitForTeardowns(std::chrono::seconds(2)))
+        resp = tryAcceptOnce(req, snapshot_out);
+    return resp;
+}
+
+TaskResponse ResourceManager::tryAcceptOnce(const TaskRequest& req, SnapshotResult* snapshot_out)
 {
     // Phase 0: type routing.
     if (req.msg_type == "TASK_REQUEST_SNAPSHOT")
@@ -1736,7 +1785,7 @@ bool ResourceManager::applyCombined(const CombinePlan& plan, int64_t t_start, in
     // keep their stale offset/decimation — RM-24), then push the new CF/SR.
     for (auto& st : streamers)
     {
-        st->pauseForRetune(settle);
+        st->pauseForRetune(settle, dev->config().retune_settle_samples);
         st->retuneSubBands(new_cf, new_sr);
         st->updateCenterFreq(new_cf);
         st->updateSampleRate(new_sr);
@@ -1820,7 +1869,8 @@ bool ResourceManager::applyCombined(const CombinePlan& plan, int64_t t_start, in
 // ── Stop / Cancel ────────────────────────────────────────────────────────
 TaskResponse ResourceManager::stopTask(const std::string& task_id,
                                        const std::string& req_id,
-                                       const std::string& reason)
+                                       const std::string& reason,
+                                       bool               async)
 {
     TaskResponse resp;
     resp.request_id = req_id;
@@ -1846,7 +1896,7 @@ TaskResponse ResourceManager::stopTask(const std::string& task_id,
             return resp;
         }
     }
-    deactivateTask(task_id, TaskState::CANCELLED, reason);
+    deactivateTask(task_id, TaskState::CANCELLED, reason, async);
     resp.accepted = true;
     resp.task_id  = task_id;
     return resp;
@@ -1854,7 +1904,8 @@ TaskResponse ResourceManager::stopTask(const std::string& task_id,
 
 TaskResponse ResourceManager::cancelTask(const std::string& task_id,
                                          const std::string& req_id,
-                                         const std::string& reason)
+                                         const std::string& reason,
+                                         bool               async)
 {
     TaskResponse resp;
     resp.request_id = req_id;
@@ -1871,7 +1922,7 @@ TaskResponse ResourceManager::cancelTask(const std::string& task_id,
             return resp;
         }
     }
-    deactivateTask(task_id, TaskState::CANCELLED, reason);
+    deactivateTask(task_id, TaskState::CANCELLED, reason, async);
     resp.accepted = true;
     resp.task_id  = task_id;
     return resp;
@@ -2246,11 +2297,24 @@ void ResourceManager::activateTask(const std::string& task_id)
                            ok ? TaskState::COMPLETED : TaskState::FAILED,
                            ok ? "Scan complete" : "Scan error");
         };
-        int settle = 0;
+        int     settle         = 0;
+        int64_t settle_samples = 0;  // > 0 only if every radio of the scan uses samples
+        bool    all_samples    = !targets.empty();
         for (auto& t : targets)
+        {
             settle = std::max(settle, t.dev->config().retune_settle_reads);
-        rt.scan_exec = std::make_unique<ScanExecutor>(
-            task_id, *rec.scan_params, std::move(retune_fn), ptrs, scan_done, settle);
+            if (t.dev->config().retune_settle_samples > 0)
+                settle_samples = std::max(settle_samples, t.dev->config().retune_settle_samples);
+            else
+                all_samples = false;
+        }
+        rt.scan_exec = std::make_unique<ScanExecutor>(task_id,
+                                                      *rec.scan_params,
+                                                      std::move(retune_fn),
+                                                      ptrs,
+                                                      scan_done,
+                                                      settle,
+                                                      all_samples ? settle_samples : 0);
     }
 
     if (rec.trigger_params && !rt.streamers.empty() && !rt.soapy_streams.empty() && dev0)
@@ -2364,7 +2428,8 @@ void ResourceManager::activateTask(const std::string& task_id)
 // ── Deactivate ───────────────────────────────────────────────────────────
 void ResourceManager::deactivateTask(const std::string& task_id,
                                      TaskState          terminal_state,
-                                     const std::string& reason)
+                                     const std::string& reason,
+                                     bool               async)
 {
     // Atomically claim deactivation rights under reg_mu_.
     // If two threads race (e.g. stopTask() vs a background IQStreamer done-callback),
@@ -2402,6 +2467,39 @@ void ResourceManager::deactivateTask(const std::string& task_id,
         // AFTER our previous deactivateTask cleaned up (found empty runtimes_).
     }
 
+    if (async)
+    {
+        // RM-17: stop/cancel used to tear the hardware down on the AMQP
+        // thread (stream close + joining a streamer blocked up to 500 ms in
+        // readStream, a scan thread mid-retune …). The terminal state is
+        // claimed above, so the reply and any second stop are already right;
+        // the slots / ports stay reserved until the teardown has released
+        // the hardware (tryAccept waits briefly for that on a conflict).
+        teardowns_in_flight_.fetch_add(1, std::memory_order_relaxed);
+        activations_in_flight_.fetch_add(1, std::memory_order_relaxed);
+        std::thread(
+            [this, task_id, terminal_state, reason, already_terminal, hw_ids]() mutable
+            {
+                teardownTask(task_id, terminal_state, reason, already_terminal, std::move(hw_ids));
+                {
+                    std::lock_guard lk(teardown_mu_);
+                    teardowns_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+                }
+                teardown_cv_.notify_all();
+                activations_in_flight_.fetch_sub(1, std::memory_order_release);
+            })
+            .detach();
+        return;
+    }
+    teardownTask(task_id, terminal_state, reason, already_terminal, std::move(hw_ids));
+}
+
+void ResourceManager::teardownTask(const std::string&       task_id,
+                                   TaskState                terminal_state,
+                                   const std::string&       reason,
+                                   bool                     already_terminal,
+                                   std::vector<std::string> hw_ids)
+{
     spdlog::info(
         "deactivateTask [{}] → {} reason={}", task_id, taskStateToString(terminal_state), reason);
 
@@ -2590,6 +2688,13 @@ void ResourceManager::watchdogTick()
     }
     pruneTerminalTasks();
 
+    // Sensors: re-read every sensor_refresh_ms on this (watchdog) thread so
+    // HEALTH_QUERY / DEVICE_TEMP_QUERY / heartbeats never do driver I/O on
+    // the AMQP thread (one readSensor round trip per radio, RM-17).
+    if (std::chrono::steady_clock::now() - last_sensor_refresh_
+        >= std::chrono::milliseconds(cfg_.policy.sensor_refresh_ms))
+        refreshSensors();
+
     // Periodically retry opening devices that failed at startup (e.g. a
     // network-attached device whose mDNS entry wasn't published yet when
     // openDevices() ran). Interval: 30 seconds.
@@ -2604,10 +2709,21 @@ void ResourceManager::watchdogTick()
             {
                 spdlog::info("watchdogTick: retrying open for offline device {}", id);
                 if (dev->open())
+                {
+                    dev->refreshSensors();
                     spdlog::info("watchdogTick: {} came online", id);
+                }
             }
         }
     }
+}
+
+void ResourceManager::refreshSensors()
+{
+    last_sensor_refresh_ = std::chrono::steady_clock::now();
+    for (auto& [id, dev] : devices_)
+        if (dev->isOnline())
+            dev->refreshSensors();
 }
 
 // ── Queries ──────────────────────────────────────────────────────────────

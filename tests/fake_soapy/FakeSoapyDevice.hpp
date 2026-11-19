@@ -176,7 +176,7 @@ public:
 
     size_t getStreamMTU(SoapySDR::Stream*) const override
     {
-        return 1024;
+        return (size_t)FakeSoapy::stream_mtu.load();
     }
 
     int readStream(SoapySDR::Stream* stream,
@@ -269,6 +269,8 @@ public:
     // ── Sensor ────────────────────────────────────────────────────────────
     std::string readSensor(const std::string&) const override
     {
+        if (int d = FakeSoapy::sensor_delay_us.load(); d > 0)  // e.g. SoapyRemote RPC
+            std::this_thread::sleep_for(std::chrono::microseconds(d));
         return std::to_string(FakeSoapy::reported_temp.load());
     }
 

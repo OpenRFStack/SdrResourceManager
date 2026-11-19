@@ -442,9 +442,18 @@ void IQStreamer::updateSampleRate(double new_sr_sps)
     current_sr_hz_.store((uint32_t)std::llround(new_sr_sps), std::memory_order_release);
 }
 
-void IQStreamer::pauseForRetune(int settle_reads)
+void IQStreamer::pauseForRetune(int settle_reads, int64_t settle_samples)
 {
-    drain_countdown_.store(settle_reads, std::memory_order_release);
+    if (settle_samples > 0)
+    {
+        drain_countdown_.store(0, std::memory_order_release);
+        drain_samples_.store(settle_samples, std::memory_order_release);
+    }
+    else
+    {
+        drain_samples_.store(0, std::memory_order_release);
+        drain_countdown_.store(settle_reads, std::memory_order_release);
+    }
 }
 
 bool IQStreamer::waitRetuneSettled(std::chrono::milliseconds timeout) const
@@ -452,7 +461,8 @@ bool IQStreamer::waitRetuneSettled(std::chrono::milliseconds timeout) const
     // Polled: a drained read takes ≥ one driver read (≥ ~0.1 ms), so 200 µs
     // granularity costs nothing and keeps the read loop free of a condvar.
     const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (drain_countdown_.load(std::memory_order_acquire) > 0)
+    while (drain_countdown_.load(std::memory_order_acquire) > 0
+           || drain_samples_.load(std::memory_order_acquire) > 0)
     {
         if (!running_.load(std::memory_order_acquire))
             return true;
@@ -676,9 +686,21 @@ void IQStreamer::workerLoop()
             drain_countdown_.fetch_sub(1, std::memory_order_release);
             continue;
         }
+        // Sample-exact drain: drop the head of this read, send the rest.
+        int skip = 0;
+        if (int64_t ds = drain_samples_.load(std::memory_order_acquire); ds > 0 && n > 0)
+        {
+            skip = (int)std::min<int64_t>(ds, n);
+            drain_samples_.fetch_sub(skip, std::memory_order_release);
+            if (skip >= n)
+                continue;
+        }
+        const int     n_send  = n - skip;
+        const size_t  off     = 2 * (size_t)skip;  // floats
+        const int64_t ts_send = ts_stream + (int64_t)std::llround(skip * ns_per_sample);
         if (dwell_changed_.exchange(false, std::memory_order_acq_rel))
             pkt_flags |= IQ_FLAG_DWELL_CHANGE;
-        if (n == 0 && pkt_flags == 0)
+        if (n_send == 0 && pkt_flags == 0)
             continue;
 
         const uint64_t cf   = (uint64_t)std::llround(current_cf_.load(std::memory_order_relaxed));
@@ -689,10 +711,10 @@ void IQStreamer::workerLoop()
             // Raw fan-out (primary channel subscribers + extra channels)
             for (auto& d : dests_)
             {
-                const float*            buf = ch_bufs[(size_t)d.buf_index].data();
+                const float*            buf = ch_bufs[(size_t)d.buf_index].data() + off;
                 const Clock::time_point ep =
                     (d.epoch != Clock::time_point{}) ? d.epoch : start_epoch_;
-                const int64_t ts0 = ts_stream + nsBetween(ep, stream_anchor);
+                const int64_t ts0 = ts_send + nsBetween(ep, stream_anchor);
                 int           ok  = sendBatch(d.fd,
                                    d.seq,
                                    d.first,
@@ -702,7 +724,7 @@ void IQStreamer::workerLoop()
                                    ts0,
                                    ns_per_sample,
                                    buf,
-                                   n,
+                                   n_send,
                                    pkt_flags);
                 if (d.buf_index == 0)
                     primary_ok = std::max(primary_ok, ok);
@@ -713,16 +735,16 @@ void IQStreamer::workerLoop()
                 if (!sb.ddc || sb.dest_fd < 0 || sb.buf_index < 0)
                     continue;
                 const int D = sb.ddc->decimRatio();
-                sb.out_buf.resize(((size_t)n / (size_t)std::max(D, 1) + 2) * 2);
+                sb.out_buf.resize(((size_t)n_send / (size_t)std::max(D, 1) + 2) * 2);
                 int n_out = 0;
-                if (n > 0)
-                    n_out =
-                        sb.ddc->process(ch_bufs[(size_t)sb.buf_index].data(), n, sb.out_buf.data());
+                if (n_send > 0)
+                    n_out = sb.ddc->process(
+                        ch_bufs[(size_t)sb.buf_index].data() + off, n_send, sb.out_buf.data());
                 if (n_out == 0 && pkt_flags == 0)
                     continue;
                 const Clock::time_point ep =
                     (sb.epoch != Clock::time_point{}) ? sb.epoch : start_epoch_;
-                const int64_t ts0 = ts_stream + nsBetween(ep, stream_anchor);
+                const int64_t ts0 = ts_send + nsBetween(ep, stream_anchor);
                 sendBatch(sb.dest_fd,
                           sb.seq,
                           sb.first,
@@ -741,10 +763,10 @@ void IQStreamer::workerLoop()
         if (primary_ok > 0)
         {
             metrics_.packets_sent += (uint64_t)primary_ok;
-            metrics_.samples_total += (uint64_t)n;
+            metrics_.samples_total += (uint64_t)n_send;
             // Mbit/s over ~250 ms windows. It used to be an EMA of megabits
             // *per read* (≈0.5 at any rate for 8 k-sample reads) — RM-67.
-            tp_bytes += (double)n * 8.0 + primary_ok * (double)IQ_PACKET_HEADER_SIZE;
+            tp_bytes += (double)n_send * 8.0 + primary_ok * (double)IQ_PACKET_HEADER_SIZE;
             if (tp_t0 == Clock::time_point{})
                 tp_t0 = t_read;
             const double dt = std::chrono::duration<double>(t_read - tp_t0).count();

@@ -29,9 +29,10 @@ main.cpp
 
 | Thread | Period | Responsibility |
 |--------|--------|---------------|
-| AMQP thread (qpid-proton) | event-driven | Receive/send AMQP messages; calls `Controller::onMessage()` |
+| AMQP thread (qpid-proton) | event-driven | Receive/send AMQP messages; calls `Controller::onMessage()`. No driver I/O for STOP / CANCEL (teardown is asynchronous) or HEALTH / TEMP queries (sensor cache) — RM-17. Admission still does a combined-window LO hop and preemption teardown inline |
 | `schedulerLoop` | 200 ms | Start SCHEDULED tasks whose `start_time ≤ now` |
-| `watchdogLoop` | 1000 ms | Expire tasks whose `stop_time ≤ now`; call `stopTask()` |
+| `watchdogLoop` | 1000 ms | Expire tasks whose `stop_time ≤ now`; refresh the sensor cache every `sensor_refresh_ms` |
+| teardown thread (per stop / cancel) | one-shot | Release the task's hardware, then its slots / ports; `tryAccept()` waits ≤ 2 s for these on a resource conflict |
 | `heartbeatLoop` | configurable | Publish `DEVICE_HEALTH` + `CONTROLLER_HEALTH` to `sdr.health` |
 | IQStreamer thread (per channel) | continuous | `readStream()` → `sendmsg()` UDP; updates metrics under mutex |
 | ScanExecutor thread (per scan task) | event-driven | Dwell timer; calls `RadioDevice::retune()` + `IQStreamer::updateCenterFreq()` |
@@ -397,6 +398,18 @@ dropped instead of being labelled with the new CF. `dwell_ms` is counted **after
 it is the time delivered at the entry: with 20 ms driver reads and 3 settle reads, timing the dwell
 from `retune_()` left a 100 ms entry with 20 ms of samples (and an entry shorter than the drain with
 none). Each entry therefore occupies ≈ retune + settle_reads × read time + dwell_ms of wall time.
+
+`<retune_settle_samples>` (> 0, every radio of the scan) drops that many samples instead, trimming
+the first read after the retune: the stale data is a buffer of samples, while a read can be a whole
+MTU. With 32 768-sample (6.5 ms) reads a 10-entry, 5 ms-dwell scan took 143 ms with 2 settle reads
+and 81 ms with 4 096 settle samples (fake driver, RM-77).
+
+**AD9361 LO timing.** A hop within ~100 MHz is a fast LO write (~15 µs); a larger step re-runs the
+VCO calibration (~280 ms on a Zynq-7020 + AD9361). Only the RX PLL is programmed (RM-13 — the idle TX
+LO used to follow and doubled the calibrations). A sample-rate change re-runs the baseband filter
+calibration (seconds): set `fixed_sample_rate_hz` on AD9361 boards. AD9361 *fastlock* profiles
+(pre-calibrated LO slots, `fastlock_store` / `fastlock_recall`) would skip the 280 ms on repeated large
+hops, but SoapyPlutoSDR exposes no settings (`writeSetting` is empty) — it needs driver support.
 
 ---
 

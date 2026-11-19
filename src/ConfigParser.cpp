@@ -121,6 +121,7 @@ AppConfig ConfigParser::parse(const std::string& path)
         cfg.policy.default_task_timeout_ms    = optLL(p, "default_task_timeout_ms", 3'600'000LL);
         cfg.policy.scheduler_tick_ms          = optI(p, "scheduler_tick_ms", 200);
         cfg.policy.watchdog_tick_ms           = optI(p, "watchdog_tick_ms", 1000);
+        cfg.policy.sensor_refresh_ms          = std::max(100, optI(p, "sensor_refresh_ms", 5000));
         cfg.policy.udp_port_pool_start        = optI(p, "udp_port_pool_start", 30'000);
         cfg.policy.udp_port_pool_end          = optI(p, "udp_port_pool_end", 31'999);
         cfg.policy.iq_packet_samples          = optI(p, "iq_packet_samples", 1024);
@@ -176,6 +177,8 @@ AppConfig ConfigParser::parse(const std::string& path)
         dc.caps.tx_atten_max_db     = optD(c, "tx_atten_max_db", 89.0);
         dc.fixed_sample_rate_hz     = optD(d, "fixed_sample_rate_hz", 0.0);
         dc.retune_settle_reads      = std::clamp((int)optD(d, "retune_settle_reads", 2.0), 0, 1000);
+        dc.retune_settle_samples    = std::clamp(
+            (int64_t)optD(d, "retune_settle_samples", 0.0), (int64_t)0, (int64_t)100'000'000);
         {
             std::string agc = opt(d, "rx_agc", "false");
             dc.rx_agc       = (agc == "true" || agc == "1");

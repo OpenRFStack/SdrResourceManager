@@ -438,6 +438,27 @@ double RadioDevice::getTemperature() const
     }
 }
 
+void RadioDevice::refreshSensors()
+{
+    auto            temps = listTemperatures();  // driver I/O, outside sensor_mu_
+    const double    t0    = getTemperature();
+    std::lock_guard lk(sensor_mu_);
+    cached_temps_ = std::move(temps);
+    cached_temp0_ = t0;
+}
+
+std::vector<RadioDevice::TempSensor> RadioDevice::cachedTemperatures() const
+{
+    std::lock_guard lk(sensor_mu_);
+    return cached_temps_;
+}
+
+double RadioDevice::cachedTemperature() const
+{
+    std::lock_guard lk(sensor_mu_);
+    return cached_temp0_;
+}
+
 std::vector<RadioDevice::TempSensor> RadioDevice::listTemperatures() const
 {
     std::lock_guard lock(mu_);
@@ -503,7 +524,7 @@ RadioDevice::Status RadioDevice::getStatus() const
         s.center_freq_hz = current_cf_;
         s.sample_rate    = current_rate_;
     }
-    s.temperature_c = getTemperature();
+    s.temperature_c = cachedTemperature();  // was a live readSensor() (RM-17)
     return s;
 }
 

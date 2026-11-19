@@ -47,6 +47,11 @@
     <!-- How often watchdog_thread wakes to expire timed-out tasks (ms) -->
     <watchdog_tick_ms>1000</watchdog_tick_ms>
 
+    <!-- How often the watchdog thread re-reads radio temperatures (ms). HEALTH_QUERY,
+         DEVICE_TEMP_QUERY and heartbeats answer from this cache, so they never do
+         driver I/O (one readSensor round trip per radio) on the AMQP thread. -->
+    <sensor_refresh_ms>5000</sensor_refresh_ms>
+
     <!-- UDP IQ stream port pool (one port per channel per task) -->
     <udp_port_pool_start>30000</udp_port_pool_start>
     <udp_port_pool_end>31999</udp_port_pool_end>

@@ -18,6 +18,7 @@ Contact author for permission: https://github.com/OpenRFStack
 PolicyConfig structs. Based on tinyxml2.
  */
 #pragma once
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -77,6 +78,12 @@ struct DeviceConfig
     /// captured at the previous LO; how many depends on the driver and its
     /// MTU, so it is per device. Default 2 (the former fixed value).
     int retune_settle_reads = 2;
+    /// <retune_settle_samples>: when > 0, drop exactly this many samples after a
+    /// retune instead of retune_settle_reads whole reads (RM-77). The stale data
+    /// is the driver's buffering — a sample count — while a read can be a whole
+    /// MTU (65 k samples = 6.5 ms at 10 MS/s): two reads cost 13 ms per scan
+    /// entry. Set it to the driver's buffered depth (unverified per radio).
+    int64_t retune_settle_samples = 0;
     // true  = let the SDR driver's hardware AGC pick gain per-channel
     //         (SoapySDR setGainMode) — best for varying/unknown signal
     //         strength (field/mobile/recon deployments).
@@ -108,17 +115,19 @@ enum class RetuneConflictPolicy
 
 struct PolicyConfig
 {
-    int                  max_concurrent_tasks    = 64;
-    double               guard_band_hz           = 200e3;
-    double               usable_bw_fraction      = 0.80;
-    int64_t              default_task_timeout_ms = 3'600'000LL;
-    int                  scheduler_tick_ms       = 200;
-    int                  watchdog_tick_ms        = 1000;
-    int                  udp_port_pool_start     = 30'000;
-    int                  udp_port_pool_end       = 31'999;
-    int                  iq_packet_samples       = 1024;
-    RetuneConflictPolicy retune_conflict_policy  = RetuneConflictPolicy::REJECT_NEW;
-    int                  heartbeat_interval_ms   = 30'000;
+    int     max_concurrent_tasks    = 64;
+    double  guard_band_hz           = 200e3;
+    double  usable_bw_fraction      = 0.80;
+    int64_t default_task_timeout_ms = 3'600'000LL;
+    int     scheduler_tick_ms       = 200;
+    int     watchdog_tick_ms        = 1000;
+    /// Sensor (temperature) cache refresh period; read on the watchdog thread.
+    int                  sensor_refresh_ms      = 5000;
+    int                  udp_port_pool_start    = 30'000;
+    int                  udp_port_pool_end      = 31'999;
+    int                  iq_packet_samples      = 1024;
+    RetuneConflictPolicy retune_conflict_policy = RetuneConflictPolicy::REJECT_NEW;
+    int                  heartbeat_interval_ms  = 30'000;
     // Terminal task records are kept for STOP/CANCEL replies and status
     // queries, then pruned (the registry used to grow forever — audit RM-38).
     int64_t terminal_task_retention_ms = 600'000;

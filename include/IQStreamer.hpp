@@ -114,7 +114,12 @@ public:
     // Drain `settle_reads` readStream() calls without sending UDP packets.
     // Call *before* the retune: the read in flight and whatever the driver
     // already buffered still carry the old LO (RM-65).
-    void pauseForRetune(int settle_reads);
+    /// @param settle_samples > 0: drop exactly this many samples instead
+    ///                       (trimming inside a read). The stale data is the
+    ///                       driver's buffer, a sample count; with MTU-sized
+    ///                       reads (65 k samples = 6.5 ms at 10 MS/s) two whole
+    ///                       reads cost 13 ms per scan entry.
+    void pauseForRetune(int settle_reads, int64_t settle_samples = 0);
 
     /// Block until the reads requested by pauseForRetune() have been dropped
     /// (or the streamer stops / @p timeout passes). The scan dwell starts
@@ -204,6 +209,7 @@ private:
     std::atomic<double>   current_cf_{0.0};
     std::atomic<bool>     dwell_changed_{false};
     std::atomic<int>      drain_countdown_{0};
+    std::atomic<int64_t>  drain_samples_{0};
     std::atomic<uint32_t> current_sr_hz_{0};
     std::thread           thread_;
     Clock::time_point     start_epoch_{};  // used when a consumer has no epoch

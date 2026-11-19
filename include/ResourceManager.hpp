@@ -44,6 +44,7 @@ Contact author for permission: https://github.com/OpenRFStack
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -105,10 +106,17 @@ public:
      * @param task_id    Task to stop.
      * @param request_id Request UUID (echoed in the response).
      * @param reason     Human-readable stop reason.
+     * @param async      false: return after the hardware is released. true:
+     *                   return once the task is terminal; teardown continues on
+     *                   a background thread (the AMQP thread uses this, RM-17).
+     *                   Its channels / ports stay reserved until released, and
+     *                   tryAccept() waits (≤ 2 s) for that on a conflict.
      * @return TaskResponse indicating success or failure (e.g. TASK_NOT_FOUND).
      */
-    TaskResponse
-    stopTask(const std::string& task_id, const std::string& request_id, const std::string& reason);
+    TaskResponse stopTask(const std::string& task_id,
+                          const std::string& request_id,
+                          const std::string& reason,
+                          bool               async = false);
 
     /**
      * @brief Cancel a task immediately (including SCHEDULED tasks).
@@ -119,7 +127,8 @@ public:
      */
     TaskResponse cancelTask(const std::string& task_id,
                             const std::string& request_id,
-                            const std::string& reason);
+                            const std::string& reason,
+                            bool               async = false);  ///< see stopTask()
 
     // ── Controller thread helpers ───────────────────────────────────────────
 
@@ -127,6 +136,9 @@ public:
     void schedulerTick();
     /// @brief Expire any RUNNING tasks whose stop_time_ms ≤ now.  Called by Controller.
     void watchdogTick();
+    /// Re-read every online radio's sensors into its cache (background
+    /// thread). Health / temperature queries answer from the cache. RM-17.
+    void refreshSensors();
 
     // ── Queries ────────────────────────────────────────────────────────────
 
@@ -245,11 +257,16 @@ private:
     /// closeDevices() waits for this to reach zero before closing devices, so
     /// an in-flight activation can never open/use a device that's being closed.
     std::atomic<int> activations_in_flight_{0};
+    /// Async stop/cancel teardowns still holding slots / ports (RM-17).
+    std::atomic<int>        teardowns_in_flight_{0};
+    std::mutex              teardown_mu_;
+    std::condition_variable teardown_cv_;
 
     std::chrono::steady_clock::time_point start_time_;
     // Timestamp of the last attempt to open offline devices. Zero on init
     // so the first watchdog tick always runs the retry.
     std::chrono::steady_clock::time_point last_device_open_attempt_{};
+    std::chrono::steady_clock::time_point last_sensor_refresh_{};  ///< watchdog thread only
 
     TaskResponse doAcceptStandard(const TaskRequest& req);
     TaskResponse doAcceptScan(const TaskRequest& req);
@@ -302,8 +319,21 @@ private:
     void         pruneTerminalTasks();
 
     void activateTask(const std::string& task_id);
-    void
-    deactivateTask(const std::string& task_id, TaskState terminal_state, const std::string& reason);
+    /// @param async true: claim the terminal state now, tear the hardware
+    ///              down on a counted background thread (stop/cancel, RM-17).
+    void         deactivateTask(const std::string& task_id,
+                                TaskState          terminal_state,
+                                const std::string& reason,
+                                bool               async = false);
+    void         teardownTask(const std::string&       task_id,
+                              TaskState                terminal_state,
+                              const std::string&       reason,
+                              bool                     already_terminal,
+                              std::vector<std::string> hw_ids);
+    TaskResponse tryAcceptOnce(const TaskRequest& req, SnapshotResult* snapshot_out);
+    /// Wait (≤ timeout) for background teardowns to release their resources.
+    /// Returns true if there were any and they all finished.
+    bool waitForTeardowns(std::chrono::milliseconds timeout);
     void notifyStateChange(const std::string& task_id);
 
     /// Preemption plan: lower-rank tasks whose removal provably makes room.

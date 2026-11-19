@@ -23,6 +23,7 @@ or the task is cancelled.
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -46,7 +47,8 @@ public:
                  RetuneFn                 retune,
                  std::vector<IQStreamer*> streamers,
                  DoneCb                   done,
-                 int                      settle_reads = 2);
+                 int                      settle_reads   = 2,
+                 int64_t                  settle_samples = 0);  ///< > 0: drop samples, not reads
     ~ScanExecutor();
     ScanExecutor(const ScanExecutor&)            = delete;
     ScanExecutor& operator=(const ScanExecutor&) = delete;
@@ -70,7 +72,8 @@ private:
     RetuneFn                 retune_;
     std::vector<IQStreamer*> streamers_;
     DoneCb                   done_;
-    int                      settle_reads_ = 2;  ///< reads drained per retune (RM-65)
+    int                      settle_reads_   = 2;  ///< reads drained per retune (RM-65)
+    int64_t                  settle_samples_ = 0;  ///< or samples (RM-77)
     std::atomic<bool>        running_{false};
     std::atomic<int>         step_{0};
     std::thread              thread_;

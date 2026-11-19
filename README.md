@@ -852,6 +852,12 @@ Edit `config/devices.xml`, add a new `<device>` block:
        Default 2; raise for deep-buffered drivers (unverified per radio). -->
   <retune_settle_reads>2</retune_settle_reads>
 
+  <!-- Or drop an exact number of samples (trimming inside a read) — the stale
+       data is the driver's buffer, while one read can be a whole MTU (65 k samples
+       = 6.5 ms at 10 MS/s). 0 = use retune_settle_reads. Measure the buffered
+       depth per radio before setting it (unverified on hardware). -->
+  <retune_settle_samples>0</retune_settle_samples>
+
   <!-- Assign to a coherency_group if this board shares a reference clock
        with other boards and you want coherent multi-board DF tasks. -->
   <coherency_group>refclk-group-0</coherency_group>

@@ -163,13 +163,14 @@ void Controller::handleTaskRequest(const TaskRequest& req, const std::string& re
 
 void Controller::handleTaskStop(const TaskRequest& req, const std::string& reply_to)
 {
-    auto resp = rm_->stopTask(req.task_id, req.request_id, req.reason);
+    // async: the hardware teardown must not run on the AMQP thread (RM-17).
+    auto resp = rm_->stopTask(req.task_id, req.request_id, req.reason, /*async=*/true);
     amqp_->sendResponse(MessageCodec::encodeTaskResponse(resp), reply_to);
 }
 
 void Controller::handleTaskCancel(const TaskRequest& req, const std::string& reply_to)
 {
-    auto resp = rm_->cancelTask(req.task_id, req.request_id, req.reason);
+    auto resp = rm_->cancelTask(req.task_id, req.request_id, req.reason, /*async=*/true);
     amqp_->sendResponse(MessageCodec::encodeTaskResponse(resp), reply_to);
 }
 
@@ -351,7 +352,7 @@ void Controller::handleTempQuery(const TaskRequest& req, const std::string& repl
         if (!dev)
             continue;
         e.online = dev->isOnline();
-        for (auto& s : dev->listTemperatures())
+        for (auto& s : dev->cachedTemperatures())  // no driver I/O here (RM-17)
         {
             bool ok = !std::isnan(s.value_c);
             e.sensors.push_back({s.name, s.value_c, ok});

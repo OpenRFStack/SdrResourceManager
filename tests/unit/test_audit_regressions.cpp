@@ -1534,6 +1534,172 @@ TEST(AuditRegression, RM13_LargeScanHopCalibratesOnlyTheRxPll)
     EXPECT_LT(ms, 1700) << "≈ 2 PLL calibrations per hop (TX LO retuned too)";
 }
 
+// ═══ RM-17 — hardware I/O on the AMQP thread ═══
+// TASK_STOP / TASK_CANCEL tore the task down inline: closing the stream and
+// joining a streamer blocked in readStream (here 400 ms reads). The AMQP
+// path now uses stopTask(async=true): terminal at once, hardware released on
+// a background thread.
+TEST(AuditRegression, RM17_AsyncStopReturnsBeforeTheTeardown)
+{
+    FakeSoapy::reset();
+    FakeSoapy::read_delay_us.store(400'000);
+    ResourceManager rm(cfgA(1, 46'560, 46'579), noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 1);
+    auto stopTime = [&](const std::string& id, bool async)
+    {
+        UdpRx rx;
+        auto  resp = rm.tryAccept(continuousReq(id, 915e6, 200e3, 1e6, 1, {rx.port}));
+        EXPECT_TRUE(resp.accepted) << resp.reject_reason;
+        EXPECT_TRUE(waitUntil(
+            [&]
+            {
+                return rm.countByState(TaskState::RUNNING) == 1;
+            },
+            2000));
+        std::this_thread::sleep_for(milliseconds(50));  // streamer inside a read
+        const auto t0 = steady_clock::now();
+        auto       st = rm.stopTask(resp.task_id, "s-" + id, "test", async);
+        const auto ms = duration_cast<milliseconds>(steady_clock::now() - t0).count();
+        EXPECT_TRUE(st.accepted);
+        EXPECT_TRUE(waitUntil(
+            []
+            {
+                return FakeSoapy::open_streams.load() == 0;
+            },
+            3000));
+        return ms;
+    };
+    const auto sync_ms  = stopTime("sync", false);
+    const auto async_ms = stopTime("async", true);
+    std::printf("RM-17: stopTask %lld ms inline vs %lld ms async\n",
+                (long long)sync_ms,
+                (long long)async_ms);
+    EXPECT_GT(sync_ms, 100);  // the reproducer: inline stop waits for the read
+    EXPECT_LT(async_ms, 20);
+}
+
+// After an async stop the channels are still being released; a request for
+// them right away must wait for that (bounded) instead of being rejected.
+TEST(AuditRegression, RM17_RequestRightAfterAsyncStopGetsTheChannels)
+{
+    FakeSoapy::reset();
+    FakeSoapy::read_delay_us.store(300'000);
+    ResourceManager rm(cfgA(1, 46'580, 46'599), noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 1);
+    UdpRx a_rx, b_rx;
+    auto  a = rm.tryAccept(continuousReq("both", 915e6, 200e3, 1e6, 2, {a_rx.port, a_rx.port}));
+    ASSERT_TRUE(a.accepted) << a.reject_reason;
+    ASSERT_TRUE(waitUntil(
+        [&]
+        {
+            return rm.countByState(TaskState::RUNNING) == 1;
+        },
+        2000));
+    std::this_thread::sleep_for(milliseconds(50));
+    ASSERT_TRUE(rm.stopTask(a.task_id, "stop-a", "test", /*async=*/true).accepted);
+    auto b = rm.tryAccept(continuousReq("next", 433e6, 200e3, 1e6, 2, {b_rx.port, b_rx.port}));
+    EXPECT_TRUE(b.accepted) << "rejected while the stopped task was releasing: " << b.reject_reason;
+}
+
+// HEALTH_QUERY / heartbeats read every radio's sensors on the AMQP thread
+// (getStatus → readSensor; one RPC per radio on SoapyRemote). Now cached,
+// refreshed on the watchdog thread.
+TEST(AuditRegression, RM17_HealthSummaryDoesNoSensorIo)
+{
+    FakeSoapy::reset();
+    ResourceManager rm(cfgA(2, 46'600, 46'619), noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 2);
+    FakeSoapy::sensor_delay_us.store(200'000);
+    auto t0 = steady_clock::now();
+    rm.refreshSensors();  // what the watchdog thread now pays
+    const auto refresh_ms = duration_cast<milliseconds>(steady_clock::now() - t0).count();
+    t0                    = steady_clock::now();
+    auto       devs       = rm.deviceSummaries();
+    const auto ms         = duration_cast<milliseconds>(steady_clock::now() - t0).count();
+    std::printf("RM-17: sensor read %lld ms (watchdog thread), deviceSummaries %lld ms\n",
+                (long long)refresh_ms,
+                (long long)ms);
+    ASSERT_EQ(devs.size(), 2u);
+    EXPECT_LT(ms, 20) << "health summary waited for the sensors";
+    EXPECT_FALSE(std::isnan(devs[0].temp_c));
+}
+
+// ═══ RM-77 — the retune drain was counted in whole reads ═══
+// With MTU-sized reads (here 32 768 samples, 6.5 ms each) two settle reads
+// cost 13 ms per scan entry although the stale data is a buffer of samples.
+// <retune_settle_samples> drops exactly that many, trimming inside a read.
+static long long scanWallMs(int64_t settle_samples)
+{
+    FakeSoapy::reset();
+    FakeSoapy::samples_per_read.store(32'768);
+    FakeSoapy::stream_mtu.store(32'768);
+    FakeSoapy::read_delay_us.store(6500);
+    auto cfg                             = cfgA(1, 46'620, 46'639);
+    cfg.devices[0].retune_settle_samples = settle_samples;
+    ResourceManager rm(cfg, noopState, noopErr);
+    EXPECT_EQ(rm.openDevices(), 1);
+    std::vector<double> cfs;
+    for (int i = 0; i < 10; ++i)
+        cfs.push_back(100e6 + i * 8e6);
+    const auto t0 = steady_clock::now();
+    runScan(rm, cfs, 5);
+    return duration_cast<milliseconds>(steady_clock::now() - t0).count();
+}
+
+TEST(AuditRegression, RM77_SampleExactDrainShortensScanEntries)
+{
+    const auto reads_ms   = scanWallMs(0);     // default: 2 whole reads
+    const auto samples_ms = scanWallMs(4096);  // 4 k stale samples
+    std::printf(
+        "RM-77: 10-entry scan %lld ms (2 reads) vs %lld ms (4096 samples)\n", reads_ms, samples_ms);
+    EXPECT_LT(samples_ms, reads_ms * 3 / 4);
+}
+
+// Sample-exact drain still drops every stale sample: pipeline one read deep
+// (1024 samples carrying the previous LO), drain exactly 1024.
+TEST(AuditRegression, RM77_SampleDrainDropsTheStaleSamples)
+{
+    FakeSoapy::reset();
+    FakeSoapy::pipeline_reads.store(1);
+    FakeSoapy::samples_per_read.store(1024);
+    FakeSoapy::read_delay_us.store(1000);
+    auto cfg                             = cfgA(1, 46'640, 46'659);
+    cfg.devices[0].retune_settle_samples = 1024;
+    ResourceManager rm(cfg, noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 1);
+    UdpRx       rx;
+    TaskRequest scan;
+    scan.msg_type             = "TASK_REQUEST_SCAN";
+    scan.request_id           = "lo-scan-s";
+    scan.task_type            = TaskType::SCAN;
+    scan.rf.rx_count          = 1;
+    scan.streaming.dest_ip    = "127.0.0.1";
+    scan.streaming.dest_ports = {rx.port};
+    ScanParams sp;
+    sp.repeat        = false;
+    sp.entries       = {entry(100e6, 1e6, 150), entry(300e6, 1e6, 300)};
+    scan.scan_params = sp;
+    ASSERT_TRUE(rm.tryAccept(scan).accepted);
+    IqPacketHeader                   h{};
+    std::vector<std::complex<float>> iq;
+    int                              labelled_new = 0, wrong = 0;
+    auto                             dl = steady_clock::now() + seconds(3);
+    while (steady_clock::now() < dl && labelled_new < 20)
+    {
+        if (!rx.recv(h, iq, 200) || iq.empty() || h.center_freq_hz != 300'000'000ull)
+            continue;
+        ++labelled_new;
+        for (auto& v : iq)
+            if (std::abs(v.real() - 0.3f) > 1e-4f)
+            {
+                ++wrong;
+                break;
+            }
+    }
+    ASSERT_GT(labelled_new, 0);
+    EXPECT_EQ(wrong, 0) << wrong << " packet(s) labelled 300 MHz carried 100 MHz samples";
+}
+
 /*
 ========================================================================
 End of file — OpenRFStack

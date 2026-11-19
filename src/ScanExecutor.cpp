@@ -28,13 +28,15 @@ ScanExecutor::ScanExecutor(const std::string&       id,
                            RetuneFn                 retune,
                            std::vector<IQStreamer*> s,
                            DoneCb                   done,
-                           int                      settle_reads)
+                           int                      settle_reads,
+                           int64_t                  settle_samples)
     : task_id_(id)
     , params_(p)
     , retune_(std::move(retune))
     , streamers_(std::move(s))
     , done_(std::move(done))
     , settle_reads_(settle_reads)
+    , settle_samples_(settle_samples)
 {
 }
 
@@ -91,7 +93,7 @@ void ScanExecutor::loop()
             // would go out flagged DWELL_CHANGE with the new CF (RM-65).
             for (auto* s : streamers_)
                 if (s && s->isRunning())
-                    s->pauseForRetune(settle_reads_);
+                    s->pauseForRetune(settle_reads_, settle_samples_);
             if (!retune_(e.center_freq_hz, e.sample_rate_sps))
             {
                 spdlog::warn("ScanExecutor [{}] retune failed step {} ({:.3f} MHz) — skipping",

@@ -31,6 +31,7 @@ Contact author for permission: https://github.com/OpenRFStack
 #include <SoapySDR/Device.hpp>
 
 #include <atomic>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <set>
@@ -178,6 +179,14 @@ public:
      */
     std::vector<TempSensor> listTemperatures() const;
 
+    /// Re-read the sensors into the cache below (driver I/O: call from a
+    /// background thread, never from the AMQP thread). RM-17.
+    void refreshSensors();
+    /// Last refreshSensors() result — no driver I/O.
+    std::vector<TempSensor> cachedTemperatures() const;
+    /// Last refreshSensors() "temp0" value — NaN before the first refresh.
+    double cachedTemperature() const;
+
     double currentCF() const;    ///< Last tuned centre frequency (Hz).
     double currentRate() const;  ///< Last set sample rate (samples/s).
 
@@ -191,7 +200,8 @@ public:
         double      temperature_c  = 0.0;
     };
 
-    /// @brief Return a status snapshot (safe to call from any thread).
+    /// @brief Return a status snapshot (safe to call from any thread). No
+    /// driver I/O: the temperature is the cached one (refreshSensors()).
     Status getStatus() const;
 
     /**
@@ -216,7 +226,12 @@ private:
     /// re-setting an unchanged rate on every scan hop reconfigured the ADC
     /// path on many drivers (RM-73). Cleared by close().
     std::map<int, double> ch_rate_;
-    int                   consecutive_stream_failures_ = 0;
+
+    /// Sensor cache (own mutex: never held across driver calls).
+    mutable std::mutex      sensor_mu_;
+    std::vector<TempSensor> cached_temps_;
+    double                  cached_temp0_                = std::numeric_limits<double>::quiet_NaN();
+    int                     consecutive_stream_failures_ = 0;
     /// Streams set up and not yet closed. reopen() unmakes dev_, which every
     /// IQStreamer / TriggerMonitor on this device holds a raw pointer to — it
     /// must never happen while one is open (RM-69).
