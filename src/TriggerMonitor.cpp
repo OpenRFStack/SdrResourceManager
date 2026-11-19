@@ -23,9 +23,9 @@ using namespace std::chrono;
 
 TriggerMonitor::TriggerMonitor(const std::string& id, const TriggerParams& p,
     SoapySDR::Device* dev, SoapySDR::Stream* stream,
-    IQStreamer* s, double rate, DoneCb done)
+    IQStreamer* s, double rate, DoneCb done, std::vector<IQStreamer*> also_start)
     : task_id_(id), params_(p), dev_(dev), stream_(stream),
-      streamer_(s), rate_(rate), done_(std::move(done)) {}
+      streamer_(s), also_(std::move(also_start)), rate_(rate), done_(std::move(done)) {}
 
 TriggerMonitor::~TriggerMonitor() { stop(); }
 
@@ -58,11 +58,25 @@ void TriggerMonitor::loop() {
     void* bufs[1]={buf.data()};
     int flags=0; long long hw_ts=0;
     int caps_done=0;
+    int consecutive_errors=0;
+    bool ok=true;
 
     while (running_.load()) {
         // Detection phase: read stream in this thread looking for threshold crossing.
         int ret=dev_->readStream(stream_, bufs, (size_t)BLK, flags, hw_ts, 200'000LL);
-        if (ret==SOAPY_SDR_TIMEOUT||ret<0) continue;
+        if (ret==SOAPY_SDR_TIMEOUT) continue;
+        if (ret<0) {
+            // Errors that return immediately used to make this a 100% CPU spin.
+            if (ret != SOAPY_SDR_OVERFLOW && ++consecutive_errors >= 50) {
+                spdlog::error("TriggerMonitor [{}] stream keeps failing ({}) — giving up",
+                              task_id_, ret);
+                ok = false;
+                break;
+            }
+            std::this_thread::sleep_for(milliseconds(std::min(consecutive_errors + 1, 20)));
+            continue;
+        }
+        consecutive_errors = 0;
         int n=std::min(ret,BLK);
         float rms=rmsDbfs(buf.data(),n);
         if (rms < params_.threshold_dbfs) continue;
@@ -73,6 +87,7 @@ void TriggerMonitor::loop() {
         // workerLoop is the sole reader (two concurrent readStream callers on the
         // same SoapySDR::Stream are not safe and would race for packets).
         if (streamer_ && !streamer_->isRunning()) streamer_->start();
+        for (auto* o : also_) if (o && !o->isRunning()) o->start();
 
         // Wait post_trigger_ms via sleep rather than by counting samples —
         // the stream is owned by IQStreamer during this window.
@@ -81,11 +96,12 @@ void TriggerMonitor::loop() {
             std::this_thread::sleep_for(milliseconds(10));
 
         if (streamer_ && streamer_->isRunning()) streamer_->stop();
+        for (auto* o : also_) if (o && o->isRunning()) o->stop();
         ++caps_done; captures_.store(caps_done);
         spdlog::info("TriggerMonitor [{}] capture #{} done", task_id_, caps_done);
         if (params_.max_captures>0 && caps_done>=params_.max_captures) break;
     }
-    if(done_) done_(task_id_,true);
+    if(done_) done_(task_id_,ok);
 }
 } // namespace sdr
 

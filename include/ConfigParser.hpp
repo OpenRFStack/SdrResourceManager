@@ -69,6 +69,11 @@ struct DeviceConfig {
     // decimate.  Eliminates the 3-4 s AD9361 BB-filter recalibration that fires
     // on every setSampleRate() call.
     double fixed_sample_rate_hz = 0.0;
+    /// readStream() calls discarded after a scan / combined-window retune
+    /// (<retune_settle_reads>). Samples already buffered in the driver were
+    /// captured at the previous LO; how many depends on the driver and its
+    /// MTU, so it is per device. Default 2 (the former fixed value).
+    int retune_settle_reads = 2;
     // true  = let the SDR driver's hardware AGC pick gain per-channel
     //         (SoapySDR setGainMode) — best for varying/unknown signal
     //         strength (field/mobile/recon deployments).
@@ -105,6 +110,10 @@ struct PolicyConfig {
     int                  iq_packet_samples        = 1024;
     RetuneConflictPolicy retune_conflict_policy   = RetuneConflictPolicy::REJECT_NEW;
     int                  heartbeat_interval_ms    = 30000;
+    // Terminal task records are kept for STOP/CANCEL replies and status
+    // queries, then pruned (the registry used to grow forever — audit RM-38).
+    int64_t              terminal_task_retention_ms = 600'000;
+    int                  max_terminal_tasks         = 1000;
 };
 
 struct AppConfig {

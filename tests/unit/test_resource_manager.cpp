@@ -1174,8 +1174,13 @@ TEST(ResourceManager, CombinedWindow_SecondTaskSharesSameChannel) {
     EXPECT_EQ(r1.streams[0].device_id,    r2.streams[0].device_id);
     EXPECT_EQ(r1.streams[0].channel_index, r2.streams[0].channel_index);
 
-    // Task 2 slice is offset from the combined device CF
-    EXPECT_NE(r2.streams[0].slice_offset_hz, 0.0);
+    // Task 2 receives its own band at its own rate. Whether that is a raw
+    // window (slice_offset_hz ≠ 0) or an RM-side DDC sub-band (centred on the
+    // slice, offset 0), centre + offset must be where the task asked to listen.
+    // (Before the audit fix the window was 1.5 MS/s, so task 2 could not be
+    // decimated and received the raw window; it is now k×1 MS/s.)
+    EXPECT_DOUBLE_EQ(r2.streams[0].center_freq_hz + r2.streams[0].slice_offset_hz, 101e6);
+    EXPECT_DOUBLE_EQ(r2.streams[0].sample_rate_sps, 1e6);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     rm.stopTask(r1.task_id, "s1", "done");

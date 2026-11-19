@@ -28,6 +28,8 @@ Contact author for permission: https://github.com/OpenRFStack
 #include <proton/value.hpp>
 #include <spdlog/spdlog.h>
 #include <mutex>
+#include <unordered_map>
+#include <algorithm>
 #include <deque>
 #include <chrono>
 #include <stdexcept>
@@ -73,6 +75,7 @@ public:
         resp_sopts.target(proton::target_options().capabilities(
             {proton::symbol("queue")}));
         response_sender_ = c.open_sender(cfg_.response_queue, resp_sopts);
+        reply_senders_.clear();          // links of the previous connection are gone
 
         status_sender_   = c.open_sender(cfg_.status_topic);
         health_sender_   = c.open_sender(cfg_.health_topic);
@@ -81,7 +84,17 @@ public:
 
     void on_message(proton::delivery&, proton::message& msg) override {
         try {
-            std::string body     = proton::get<std::string>(msg.body());
+            // Accept JSON sent as an AMQP string or as binary data (many
+            // clients/bridges send bytes); binary used to throw and the
+            // request was dropped without any reply.
+            std::string body;
+            const proton::value& v = msg.body();
+            if (v.type() == proton::BINARY) {
+                auto b = proton::get<proton::binary>(v);
+                body.assign(b.begin(), b.end());
+            } else {
+                body = proton::get<std::string>(v);
+            }
             std::string reply_to = msg.reply_to();   // empty if not set
             parent_.on_message_(body, reply_to);
         } catch (const std::exception& ex) {
@@ -122,6 +135,39 @@ public:
     proton::sender response_sender_;
     proton::sender status_sender_;
     proton::sender health_sender_;
+
+    // Reply links by address (reactor thread only). Consumers with dynamic
+    // reply queues (AcquisitionApp, AnalysisApp, DemodApp) used to get a NEW
+    // sender link for every response, never closed — unbounded link growth on
+    // both the controller and the broker (AMQP-01). Bounded LRU.
+    proton::sender replySender(proton::connection conn, const std::string& addr) {
+        auto it = reply_senders_.find(addr);
+        if (it != reply_senders_.end() && it->second.first.active()) {
+            it->second.second = ++reply_clock_;
+            return it->second.first;
+        }
+        if (it != reply_senders_.end()) reply_senders_.erase(it);
+        if (reply_senders_.size() >= kMaxReplySenders) {
+            auto oldest = std::min_element(reply_senders_.begin(), reply_senders_.end(),
+                [](auto& a, auto& b) { return a.second.second < b.second.second; });
+            try { oldest->second.first.close(); } catch (...) {}
+            reply_senders_.erase(oldest);
+        }
+        proton::sender_options sopts;
+        sopts.target(proton::target_options().capabilities({proton::symbol("queue")}));
+        proton::sender s = conn.open_sender(addr, sopts);
+        reply_senders_[addr] = {s, ++reply_clock_};
+        return s;
+    }
+    void on_sender_close(proton::sender& s) override { forget(s); }
+    void on_sender_error(proton::sender& s) override { forget(s); }
+    void forget(proton::sender& s) {
+        for (auto it = reply_senders_.begin(); it != reply_senders_.end(); ++it)
+            if (it->second.first == s) { reply_senders_.erase(it); return; }
+    }
+    static constexpr size_t kMaxReplySenders = 64;
+    std::unordered_map<std::string, std::pair<proton::sender, uint64_t>> reply_senders_;
+    uint64_t reply_clock_ = 0;
 
 private:
     AmqpClient&   parent_;
@@ -190,10 +236,8 @@ void AmqpClient::sendResponse(const std::string& body, const std::string& reply_
         if (reply_to.empty() || reply_to == cfg_.response_queue) {
             handler_->sendOn(handler_->response_sender_, body);
         } else {
-            proton::sender_options sopts;
-            sopts.target(proton::target_options().capabilities({proton::symbol("queue")}));
             proton::connection conn = handler_->response_sender_.connection();
-            proton::sender s = conn.open_sender(reply_to, sopts);
+            proton::sender s = handler_->replySender(conn, reply_to);
             handler_->sendOn(s, body);
         }
     });

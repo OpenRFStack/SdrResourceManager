@@ -14,6 +14,7 @@ Contact author for permission: https://github.com/OpenRFStack
 #include <spdlog/spdlog.h>
 #include <SoapySDR/Formats.hpp>
 #include <SoapySDR/Errors.hpp>
+#include <SoapySDR/Types.hpp>
 #include <stdexcept>
 #include <limits>
 #include <cmath>
@@ -33,6 +34,14 @@ bool RadioDevice::open() {
         // use "uri" (libiio convention: "ip:192.168.1.x", "usb:X.Y.Z", etc.)
         if (cfg_.driver == "remote") {
             args["remote"] = cfg_.uri;
+        } else if (!cfg_.uri.empty() && cfg_.uri.find('=') != std::string::npos) {
+            // "serial=0000…,type=b200" / "addr=192.168.10.2": a SoapySDR
+            // kwargs string, for drivers that identify a unit by something
+            // other than a libiio uri (UHD, rtlsdr, hackrf, lime …). It used
+            // to be passed whole as uri=…, which those drivers ignore — every
+            // entry of the same driver then opened the first unit (RM-14).
+            for (auto& [k, v] : SoapySDR::KwargsFromString(cfg_.uri)) args[k] = v;
+            args["driver"] = cfg_.driver;
         } else if (!cfg_.uri.empty()) {
             args["uri"] = cfg_.uri;
         } else {
@@ -104,6 +113,11 @@ void RadioDevice::close() {
     if (!online_) return;
     if (dev_) { SoapySDR::Device::unmake(dev_); dev_=nullptr; }
     online_.store(false, std::memory_order_release);
+    // A re-made device starts at the driver's defaults: forget what we set,
+    // or tune() skips setSampleRate() after a reopen and the RM advertises a
+    // rate the hardware is not running at (RM-70).
+    current_cf_ = 0.0; current_rate_ = 0.0;
+    open_streams_ = 0;
     if (!claimed_key_.empty()) {
         std::lock_guard<std::mutex> claim_lock(claimMutex());
         claimedUris().erase(claimed_key_);
@@ -205,6 +219,7 @@ SoapySDR::Stream* RadioDevice::openRxStream(const std::vector<int>& channels) {
             for (int c : channels) chans.push_back(static_cast<size_t>(c));
             SoapySDR::Stream* s = dev_->setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32, chans);
             consecutive_stream_failures_ = 0;
+            if (s) ++open_streams_;
             return s;
         } catch (const std::exception& ex) {
             spdlog::error("[{}] openRxStream: {}", cfg_.id, ex.what());
@@ -214,40 +229,52 @@ SoapySDR::Stream* RadioDevice::openRxStream(const std::vector<int>& channels) {
     // half-open TCP connection to iiod causes the NEXT connect() to block for
     // the OS TCP connect timeout (up to 2 min), not the 5 s iio_context timeout.
     // Reopen the device after consecutive failures to get a fresh connection.
-    ++consecutive_stream_failures_;
-    if (consecutive_stream_failures_ >= 2) {
+    int live_streams = 0, fails = 0;
+    {
+        std::lock_guard lock(mu_);
+        fails = ++consecutive_stream_failures_;
+        live_streams = open_streams_;
+    }
+    if (fails >= 2 && live_streams > 0) {
+        // Other tasks are streaming from this device: the connection works,
+        // and unmaking it would free the device under their worker threads.
+        spdlog::warn("[{}] openRxStream: {} consecutive failures, not reopening — {} stream(s) live",
+                     cfg_.id, fails, live_streams);
+    } else if (fails >= 2) {
         spdlog::warn("[{}] openRxStream: {} consecutive failures — reopening device",
-                     cfg_.id, consecutive_stream_failures_);
-        consecutive_stream_failures_ = 0;
+                     cfg_.id, fails);
+        { std::lock_guard lock(mu_); consecutive_stream_failures_ = 0; }
         reopen();
     }
     return nullptr;
 }
 
 bool RadioDevice::activateStream(SoapySDR::Stream* s) {
-    if (!s||!dev_) return false;
     std::lock_guard lock(mu_);
+    if (!s||!dev_) return false;
     try { return dev_->activateStream(s)==0; }
     catch (...) { return false; }
 }
 
 void RadioDevice::deactivateStream(SoapySDR::Stream* s) {
-    if (!s||!dev_) return;
     std::lock_guard lock(mu_);
+    if (!s||!dev_) return;
     try { dev_->deactivateStream(s); } catch (...) {}
 }
 
 void RadioDevice::closeStream(SoapySDR::Stream* s) {
-    if (!s||!dev_) return;
     std::lock_guard lock(mu_);
+    if (!s||!dev_) return;
     try { dev_->closeStream(s); } catch (...) {}
+    if (open_streams_ > 0) --open_streams_;
 }
 
 int RadioDevice::readStream(SoapySDR::Stream* s, void** buffs, size_t numElems,
                              int& flags, long long& timeNs, long timeoutUs) {
     if (!s||!dev_) return SOAPY_SDR_NOT_SUPPORTED;
     // NOTE: readStream must NOT hold mu_ — it blocks for up to timeoutUs.
-    // The device pointer is stable for the lifetime of RadioDevice.
+    // dev_ only changes in reopen(), which openRxStream() no longer triggers
+    // while any stream is open.
     return dev_->readStream(s, buffs, numElems, flags, timeNs, timeoutUs);
 }
 

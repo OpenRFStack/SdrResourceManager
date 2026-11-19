@@ -33,13 +33,20 @@ void FftEngine::ensurePlan(int n) {
     fout_ = fftwf_alloc_complex((size_t)n);
     plan_ = fftwf_plan_dft_1d(n,(fftwf_complex*)fin_,(fftwf_complex*)fout_,FFTW_FORWARD,FFTW_ESTIMATE);
     plan_size_=n;
+    // The window is computed once per size (it used to cost n cos() calls per
+    // averaged frame).
+    window_.assign((size_t)n, 0.0f);
+    window_sum_ = 0.0;
+    for (int i = 0; i < n && n > 1; ++i) {
+        window_[(size_t)i] = (float)(0.5*(1.0-std::cos(2.0*M_PI*i/(n-1))));
+        window_sum_ += window_[(size_t)i];
+    }
 }
 
 void FftEngine::hannWindow(void* in, int n) {
     auto* c = reinterpret_cast<std::complex<float>*>(in);
     if (n == 1) { c[0] *= 0.0f; return; }  // single sample: Hann(0/(n-1)) = 0
-    for (int i=0;i<n;++i)
-        c[i] *= (float)(0.5*(1.0-std::cos(2.0*M_PI*i/(n-1))));
+    for (int i=0;i<n;++i) c[i] *= window_[(size_t)i];
 }
 
 void FftEngine::fftshift(std::vector<double>& b) {
@@ -82,7 +89,10 @@ SnapshotResult FftEngine::compute(
         auto* in  = (fftwf_complex*)fin_;
         auto* out = (fftwf_complex*)fout_;
         std::vector<double> pwr((size_t)fft_size,0.0);
-        double norm=(double)fft_size*(double)fft_size;
+        // Normalise by the window's coherent gain so a full-scale tone reads
+        // 0 dBFS (dividing by N² read it at 20·log10(Σw/N) ≈ −6 dB — RM-15).
+        const double norm = window_sum_ > 0.0 ? window_sum_ * window_sum_
+                                              : (double)fft_size*(double)fft_size;
 
         for (int a=0;a<n_avg;++a) {
             const float* src=s.data()+(size_t)a*fft_size*2;

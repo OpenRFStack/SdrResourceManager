@@ -40,7 +40,7 @@ public:
 
 private:
     void ensurePlan(int n);
-    void hannWindow(void* in, int n);
+    void hannWindow(void* in, int n);   ///< in *= cached window (built in ensurePlan)
     void fftshift(std::vector<double>& bins);
 
     mutable std::mutex mu_;
@@ -48,6 +48,8 @@ private:
     void* plan_=nullptr;
     void* fin_=nullptr;
     void* fout_=nullptr;
+    std::vector<float> window_;         ///< Hann window of plan_size_
+    double window_sum_ = 0.0;           ///< Σw — coherent gain × N
 };
 
 } // namespace sdr

@@ -21,6 +21,8 @@ or the task is cancelled.
 #pragma once
 #include "sdr/Types.hpp"
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 #include <vector>
 #include <functional>
@@ -37,7 +39,8 @@ public:
     using DoneCb   = std::function<void(const std::string& task_id, bool ok)>;
 
     ScanExecutor(const std::string& task_id, const ScanParams& params,
-                 RetuneFn retune, std::vector<IQStreamer*> streamers, DoneCb done);
+                 RetuneFn retune, std::vector<IQStreamer*> streamers, DoneCb done,
+                 int settle_reads = 2);
     ~ScanExecutor();
     ScanExecutor(const ScanExecutor&)=delete;
     ScanExecutor& operator=(const ScanExecutor&)=delete;
@@ -53,9 +56,12 @@ private:
     RetuneFn                 retune_;
     std::vector<IQStreamer*> streamers_;
     DoneCb                   done_;
+    int                      settle_reads_ = 2;   ///< reads drained per retune (RM-65)
     std::atomic<bool>        running_{false};
     std::atomic<int>         step_{0};
     std::thread              thread_;
+    std::mutex               wait_mu_;   // dwell wait; stop() notifies
+    std::condition_variable  wait_cv_;
     void loop();
 };
 } // namespace sdr

@@ -159,8 +159,11 @@ TEST(IQStreamer, DwellChangeFlagSetAfterUpdateCenterFreq) {
 
     streamer.updateCenterFreq(2400e6);
 
+    // Packets sent before updateCenterFreq() may still be queued on the
+    // socket (many of them under a loaded CI host), so read until the flag
+    // shows up rather than giving up after 10 packets.
     bool found = false;
-    for (int i = 0; i < 10 && !found; ++i) {
+    for (int i = 0; i < 5000 && !found; ++i) {
         ssize_t n = recvPacket(fd, buf);
         if (n < (ssize_t)IQ_PACKET_HEADER_SIZE) break;
         IqPacketHeader hdr;

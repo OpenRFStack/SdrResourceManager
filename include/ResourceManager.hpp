@@ -47,6 +47,7 @@ Contact author for permission: https://github.com/OpenRFStack
 #include <functional>
 #include <chrono>
 #include <atomic>
+#include <optional>
 
 namespace sdr {
 
@@ -92,7 +93,7 @@ public:
      * @return TaskResponse with accepted=true and assigned streams, or
      *         accepted=false with a reject_code and reject_reason.
      */
-    TaskResponse tryAccept(const TaskRequest& req);
+    TaskResponse tryAccept(const TaskRequest& req, SnapshotResult* snapshot_out = nullptr);
 
     /**
      * @brief Stop a running or scheduled task gracefully.
@@ -156,12 +157,27 @@ private:
 
     std::unordered_map<std::string, std::unique_ptr<RadioDevice>>     devices_;
     std::unordered_map<std::string, std::unique_ptr<SpectrumTimeline>> timelines_;
+    /// Device ids in devices.xml order. Every device scan iterates this, so
+    /// allocation (and the stream order in coherent responses) is deterministic
+    /// instead of following unordered_map hash order.
+    std::vector<std::string> device_order_;
 
     std::unique_ptr<UdpPortPool> port_pool_;
     std::unique_ptr<FftEngine>   fft_engine_;
 
     mutable std::mutex                             reg_mu_;
     std::unordered_map<std::string, TaskRecord>    registry_;
+    /// When each terminal task became terminal (guarded by reg_mu_).
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> terminal_since_;
+    /// Per-request RX gain overrides (rf.rx_gain_db / rf.rx_agc), by task id.
+    struct GainRequest { std::vector<double> gain_db; std::vector<bool> agc; };
+    std::unordered_map<std::string, GainRequest> task_gains_;   // guarded by reg_mu_
+    /// Serialises state-change callbacks (keeps TASK_STATUS ordered) without
+    /// holding reg_mu_ while the callback runs.
+    std::mutex notify_mu_;
+    /// Serialises admission (plan → reserve ports → apply → insert slot) across
+    /// the AMQP thread and snapshot threads; never held during hardware capture.
+    std::mutex accept_mu_;
 
     /// Per-channel hardware state shared by all tasks multicast from the same channel.
     struct ChannelState {
@@ -179,6 +195,7 @@ private:
         std::unique_ptr<ScanExecutor>            scan_exec;
         std::unique_ptr<TriggerMonitor>          trig_mon;
         bool                                     is_subband_consumer = false;
+        IQStreamer::Clock::time_point            epoch{};   ///< task time base
     };
     mutable std::mutex                              rt_mu_;
     std::unordered_map<std::string, TaskRuntime>    runtimes_;
@@ -202,25 +219,58 @@ private:
 
     TaskResponse doAcceptStandard(const TaskRequest& req);
     TaskResponse doAcceptScan(const TaskRequest& req);
-    TaskResponse doAcceptSnapshot(const TaskRequest& req);
+    TaskResponse doAcceptSnapshot(const TaskRequest& req, SnapshotResult* out);
     TaskResponse doAcceptCalibration(const TaskRequest& req);
 
     struct DeviceCandidate { RadioDevice* device; FitResult fit; };
+    using DeviceFilter = std::function<bool(const RadioDevice&)>;
     std::optional<DeviceCandidate>
         findBestDevice(double cf, double bw, double sr,
                        int rx_count, int tx_count,
                        int64_t t_start, int64_t t_stop,
                        const std::string& preferred,
                        int preferred_channel = -1,
-                       bool device_required  = false) const;
+                       bool device_required  = false,
+                       const FitOptions& opts = {},
+                       const DeviceFilter& extra_ok = nullptr,
+                       std::string* why = nullptr) const;
+    /// Hardware rate needed to deliver `sr` on this device (fixed rate or
+    /// sub-floor multiple; the DDC bridges the difference), or nullopt.
+    std::optional<double> acquisitionRate(const RadioDevice& dev, double sr) const;
+    bool deviceCanServe(const RadioDevice& dev, double cf, double bw, double sr,
+                        int rx, int tx) const;
+    /// Reserve `n` UDP ports, honouring client pre-bound dest_ports first.
+    /// pool_ports receives the ports taken from the pool (to release on reject).
+    bool reservePorts(const std::vector<int>& client_ports, int n,
+                      std::vector<int>& ports, std::vector<int>& pool_ports);
+    TaskResponse acceptCoherent(const TaskRequest& req, TaskResponse resp,
+                                int64_t t_start, int64_t t_stop, const FitOptions& opts,
+                                const DeviceFilter& extra_ok);
+    TaskRecord newRecord(const TaskRequest& req, const std::string& task_id,
+                         int64_t t_start, int64_t t_stop,
+                         std::vector<TaskRecord::DeviceAllocation> allocs) const;
+    void commitTask(TaskRecord rec, const RfRequest& rf);
+    void pruneTerminalTasks();
 
     void activateTask(const std::string& task_id);
     void deactivateTask(const std::string& task_id, TaskState terminal_state,
                         const std::string& reason);
     void notifyStateChange(const std::string& task_id);
 
-    bool tryPreemptConflicting(const TaskRequest& req, int64_t t_start, int64_t t_stop);
-    std::optional<DeviceCandidate> tryRetuneCombined(const TaskRequest& req, int64_t t_start, int64_t t_stop);
+    /// Preemption plan: lower-rank tasks whose removal provably makes room.
+    struct PreemptPlan { std::string device_id; std::vector<std::string> victims; };
+    std::optional<PreemptPlan> planPreemption(const TaskRequest& req, int64_t t_start,
+                                              int64_t t_stop, const FitOptions& opts) const;
+    void applyPreemption(const PreemptPlan& plan, int rank, const std::string& request_id);
+    /// Combined-window plan; applyCombined() performs the retune. Planning has
+    /// no side effects, so a request rejected later leaves hardware untouched.
+    struct CombinePlan {
+        DeviceCandidate cand;
+        double old_cf = 0, old_sr = 0;
+        bool   hw_changed = false;
+    };
+    std::optional<CombinePlan> planCombined(const TaskRequest& req, int64_t t_start, int64_t t_stop) const;
+    bool applyCombined(const CombinePlan& plan, int64_t t_start, int64_t t_stop);
 
     std::string makeStreamId(const std::string& task_id, const std::string& type,
                              const std::string& dev_id, int ch_idx) const;

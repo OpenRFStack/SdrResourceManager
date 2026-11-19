@@ -11,6 +11,7 @@ Contact author for permission: https://github.com/OpenRFStack
 ========================================================================
 */
 #include "ConfigParser.hpp"
+#include <algorithm>
 #include <tinyxml2.h>
 #include <stdexcept>
 
@@ -80,6 +81,8 @@ AppConfig ConfigParser::parse(const std::string& path) {
         cfg.policy.udp_port_pool_end       = optI(p,"udp_port_pool_end",31999);
         cfg.policy.iq_packet_samples       = optI(p,"iq_packet_samples",1024);
         cfg.policy.heartbeat_interval_ms   = optI(p,"heartbeat_interval_ms",30000);
+        cfg.policy.terminal_task_retention_ms = optLL(p,"terminal_task_retention_ms",600'000LL);
+        cfg.policy.max_terminal_tasks         = optI(p,"max_terminal_tasks",1000);
         std::string rcp = opt(p,"retune_conflict_policy","REJECT_NEW");
         cfg.policy.retune_conflict_policy =
             (rcp=="CANCEL_LOWER") ? RetuneConflictPolicy::CANCEL_LOWER
@@ -87,6 +90,12 @@ AppConfig ConfigParser::parse(const std::string& path) {
     }
     if (cfg.policy.udp_port_pool_start >= cfg.policy.udp_port_pool_end)
         throw std::runtime_error("udp_port_pool_start must be < udp_port_pool_end");
+    // One UDP datagram carries a 32-byte header + 8 bytes/sample and may not
+    // exceed 65507 bytes: larger values made every sendmsg() fail with
+    // EMSGSIZE (silently — no packets at all). 183 fits a 1500-byte MTU.
+    if (cfg.policy.iq_packet_samples < 1 || cfg.policy.iq_packet_samples > 8184)
+        throw std::runtime_error("iq_packet_samples must be in [1, 8184] (65507-byte UDP limit); got "
+                                 + std::to_string(cfg.policy.iq_packet_samples));
 
     auto* devs = root->FirstChildElement("devices");
     if (!devs) throw std::runtime_error("<devices> not found");
@@ -117,6 +126,7 @@ AppConfig ConfigParser::parse(const std::string& path) {
         dc.caps.tx_atten_min_db     = optD(c,"tx_atten_min_db",0.0);
         dc.caps.tx_atten_max_db     = optD(c,"tx_atten_max_db",89.0);
         dc.fixed_sample_rate_hz     = optD(d,"fixed_sample_rate_hz", 0.0);
+        dc.retune_settle_reads      = std::clamp((int)optD(d,"retune_settle_reads", 2.0), 0, 1000);
         { std::string agc = opt(d,"rx_agc","false");
           dc.rx_agc = (agc == "true" || agc == "1"); }
         dc.rx_gain_db               = optD(d,"rx_gain_db", 30.0);
@@ -124,6 +134,11 @@ AppConfig ConfigParser::parse(const std::string& path) {
     }
     if (cfg.devices.empty())
         throw std::runtime_error("No <device> entries found");
+    for (size_t i = 0; i < cfg.devices.size(); ++i)
+        for (size_t j = i + 1; j < cfg.devices.size(); ++j)
+            if (cfg.devices[i].id == cfg.devices[j].id)
+                throw std::runtime_error("Duplicate <device id=\"" + cfg.devices[i].id +
+                                         "\"> — device ids must be unique");
     return cfg;
 }
 

@@ -63,7 +63,7 @@ public:
     /// @brief True while the device is open and usable.
     bool isOnline() const { return online_.load(std::memory_order_acquire); }
     /// @brief Raw SoapySDR device pointer — valid only while isOnline().
-    SoapySDR::Device* soapyDevice() const { return dev_; }
+    SoapySDR::Device* soapyDevice() const { std::lock_guard l(mu_); return dev_; }
 
     const std::string&   id()     const { return cfg_.id; }
     const std::string&   group()  const { return cfg_.coherency_group; }
@@ -179,6 +179,10 @@ private:
     double current_cf_   = 0.0;
     double current_rate_ = 0.0;
     int consecutive_stream_failures_ = 0;
+    /// Streams set up and not yet closed. reopen() unmakes dev_, which every
+    /// IQStreamer / TriggerMonitor on this device holds a raw pointer to — it
+    /// must never happen while one is open (RM-69).
+    int open_streams_ = 0;
 
     // Identifier (uri/hostname/serial/label) claimed via Device::enumerate()
     // when devices.xml leaves <uri> empty, so a second RadioDevice instance

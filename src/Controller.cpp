@@ -11,6 +11,7 @@ Contact author for permission: https://github.com/OpenRFStack
 ========================================================================
 */
 #include "Controller.hpp"
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <algorithm>
 #include <chrono>
@@ -70,8 +71,8 @@ void Controller::stop() {
     if (heartbeat_thread_.joinable()) heartbeat_thread_.join();
     {
         std::lock_guard<std::mutex> lk(snapshot_mu_);
-        for (auto& t : snapshot_threads_)
-            if (t.joinable()) t.join();
+        for (auto& st : snapshot_threads_)
+            if (st.t.joinable()) st.t.join();
         snapshot_threads_.clear();
     }
     rm_->closeDevices();
@@ -81,7 +82,24 @@ void Controller::stop() {
 void Controller::onMessage(const std::string& body, const std::string& reply_to) {
     auto req = MessageCodec::decode(body);
     if (!req) {
-        spdlog::warn("Controller: failed to decode message");
+        // Tell the client instead of letting it time out (ICD: INVALID_REQUEST
+        // = malformed JSON or missing required fields). Needs a request_id to
+        // correlate; without one there is nobody to answer.
+        std::string req_id, corr_id;
+        try {
+            auto j = nlohmann::json::parse(body);
+            if (j.is_object()) {
+                if (j.contains("request_id") && j["request_id"].is_string())
+                    req_id = j["request_id"].get<std::string>();
+                if (j.contains("correlation_id") && j["correlation_id"].is_string())
+                    corr_id = j["correlation_id"].get<std::string>();
+            }
+        } catch (...) {}
+        spdlog::warn("Controller: failed to decode message{}",
+                     req_id.empty() ? " (no request_id — dropped)" : " " + req_id);
+        if (!req_id.empty())
+            sendReject(req_id, corr_id, RejectCode::INVALID_REQUEST,
+                       "Malformed request or missing/invalid fields", reply_to);
         return;
     }
     spdlog::debug("Controller: received msg_type={} req_id={}",
@@ -147,10 +165,21 @@ void Controller::handleSnapshotRequest(const TaskRequest& req, const std::string
     // risk broker disconnect. Track in snapshot_threads_ so stop() can join them
     // before destroying rm_/amqp_ — detach() would leave a dangling 'this'.
     std::lock_guard<std::mutex> lk(snapshot_mu_);
-    snapshot_threads_.push_back(std::thread([this, req, reply_to]() {
-        auto resp = rm_->tryAccept(req);
+    for (auto it = snapshot_threads_.begin(); it != snapshot_threads_.end(); ) {
+        if (it->done->load()) { if (it->t.joinable()) it->t.join(); it = snapshot_threads_.erase(it); }
+        else ++it;
+    }
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    snapshot_threads_.push_back({std::thread([this, req, reply_to, done]() {
+        SnapshotResult snap;
+        auto resp = rm_->tryAccept(req, &snap);
+        // TASK_RESPONSE first (existing clients read the first reply), then the
+        // SNAPSHOT_RESULT with the power bins (ICD §8.5/§8.14) — it was never
+        // sent, the FFT was computed and discarded (RM-56).
         amqp_->sendResponse(MessageCodec::encodeTaskResponse(resp), reply_to);
-    }));
+        amqp_->sendResponse(MessageCodec::encodeSnapshotResult(req.request_id, snap), reply_to);
+        done->store(true);
+    }), done});
 }
 
 void Controller::onTaskStateChanged(const TaskRecord& rec) {

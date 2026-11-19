@@ -20,9 +20,9 @@ namespace sdr {
 using namespace std::chrono;
 
 ScanExecutor::ScanExecutor(const std::string& id, const ScanParams& p,
-    RetuneFn retune, std::vector<IQStreamer*> s, DoneCb done)
+    RetuneFn retune, std::vector<IQStreamer*> s, DoneCb done, int settle_reads)
     : task_id_(id), params_(p), retune_(std::move(retune)),
-      streamers_(std::move(s)), done_(std::move(done)) {}
+      streamers_(std::move(s)), done_(std::move(done)), settle_reads_(settle_reads) {}
 
 ScanExecutor::~ScanExecutor() { stop(); }
 
@@ -33,7 +33,11 @@ void ScanExecutor::start() {
 }
 
 void ScanExecutor::stop() {
-    running_.store(false);
+    {
+        std::lock_guard lk(wait_mu_);
+        running_.store(false);
+    }
+    wait_cv_.notify_all();
     if (!thread_.joinable()) return;
     // If called from the scan thread itself (via done-callback), joining would deadlock.
     if (thread_.get_id() == std::this_thread::get_id())
@@ -44,34 +48,49 @@ void ScanExecutor::stop() {
 
 void ScanExecutor::loop() {
     if (params_.entries.empty()) { if(done_) done_(task_id_,false); return; }
-    bool go=true;
+    bool go = true, ok = true;
     while (go && running_.load()) {
+        int retuned = 0;
         for (size_t i=0; i<params_.entries.size() && running_.load(); ++i) {
             const auto& e = params_.entries[i];
             step_.store((int)i);
+            // Discard the reads that straddle the retune: samples already in
+            // the driver pipeline were captured at the previous entry's LO but
+            // would go out flagged DWELL_CHANGE with the new CF (RM-65).
+            for (auto* s : streamers_)
+                if (s && s->isRunning()) s->pauseForRetune(settle_reads_);
             if (!retune_(e.center_freq_hz, e.sample_rate_sps)) {
                 spdlog::warn("ScanExecutor [{}] retune failed step {} ({:.3f} MHz) — skipping",
                              task_id_, i, e.center_freq_hz / 1e6);
                 continue;
             }
+            ++retuned;
+            // ICD §8.4: CF *and* sample rate in the packet header follow the entry.
             for (auto* s : streamers_)
-                if (s && s->isRunning()) s->updateCenterFreq(e.center_freq_hz);
+                if (s && s->isRunning()) {
+                    s->updateSampleRate(e.sample_rate_sps);
+                    s->updateCenterFreq(e.center_freq_hz);
+                }
             spdlog::debug("ScanExecutor [{}] step {} cf={:.3f}MHz dwell={}ms", task_id_, i+1, e.center_freq_hz/1e6, e.dwell_ms);
-            auto dl = steady_clock::now() + milliseconds(e.dwell_ms);
-            while (running_.load()) {
-                auto now = steady_clock::now();
-                if (now >= dl) break;
-                // Sleep until the deadline or 10ms before it (to stay responsive
-                // to stop() without burning CPU on a busy-wait).
-                auto wake = dl - milliseconds(10);
-                if (wake > now) std::this_thread::sleep_until(wake);
-            }
+            // Sleep for the dwell; stop() wakes us immediately. (The previous
+            // loop busy-waited the last 10 ms of every dwell.)
+            std::unique_lock lk(wait_mu_);
+            wait_cv_.wait_until(lk, steady_clock::now() + milliseconds(e.dwell_ms),
+                                [this] { return !running_.load(); });
+        }
+        // A pass in which no entry could be tuned means the hardware is gone:
+        // fail instead of spinning on retune() at 100% CPU (repeat mode) or
+        // reporting a scan that never happened as successful.
+        if (retuned == 0 && running_.load()) {
+            spdlog::error("ScanExecutor [{}] no entry could be tuned — failing scan", task_id_);
+            ok = false; go = false;
         }
         if (!params_.repeat) go=false;
     }
     spdlog::info("ScanExecutor [{}] done", task_id_);
-    if(done_) done_(task_id_,true);
+    if(done_) done_(task_id_,ok);
 }
+
 } // namespace sdr
 
 /*

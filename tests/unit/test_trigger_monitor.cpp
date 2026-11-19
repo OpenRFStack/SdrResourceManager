@@ -124,8 +124,10 @@ TEST(TriggerMonitor, ZeroMaxCapturesRunsUntilExplicitStop) {
                        [](const std::string&, bool) {});
     mon.start();
 
-    // Let it accumulate multiple captures
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // Let it accumulate captures. Poll (bounded) instead of a fixed 100 ms
+    // sleep, which was too short under ThreadSanitizer's slowdown.
+    for (int i = 0; i < 200 && mon.captureCount() == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     EXPECT_TRUE(mon.isRunning());
     EXPECT_GT(mon.captureCount(), 0);
 

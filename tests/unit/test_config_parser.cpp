@@ -13,12 +13,17 @@ Contact author for permission: https://github.com/OpenRFStack
 #include <gtest/gtest.h>
 #include "ConfigParser.hpp"
 #include <fstream>
+#include <unistd.h>
 #include <stdexcept>
 
 using namespace sdr;
 
 static std::string writeTmp(const std::string& xml) {
-    const std::string path = "/tmp/sdr_test_config.xml";
+    // Unique per process: ctest runs every test as its own process in
+    // parallel, and a shared fixed path let tests read each other's XML.
+    static int n = 0;
+    const std::string path = "/tmp/sdr_test_config_" + std::to_string(::getpid()) + "_"
+                           + std::to_string(n++) + ".xml";
     std::ofstream f(path);
     f << xml;
     return path;

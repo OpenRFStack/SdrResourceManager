@@ -36,7 +36,8 @@ public:
 
     TriggerMonitor(const std::string& task_id, const TriggerParams& params,
                    SoapySDR::Device* dev, SoapySDR::Stream* stream,
-                   IQStreamer* streamer, double sample_rate_sps, DoneCb done);
+                   IQStreamer* streamer, double sample_rate_sps, DoneCb done,
+                   std::vector<IQStreamer*> also_start = {});
     ~TriggerMonitor();
     TriggerMonitor(const TriggerMonitor&)=delete;
     TriggerMonitor& operator=(const TriggerMonitor&)=delete;
@@ -52,6 +53,7 @@ private:
     SoapySDR::Device*  dev_;
     SoapySDR::Stream*  stream_;
     IQStreamer*        streamer_;
+    std::vector<IQStreamer*> also_;   // other streams of the task (coherent capture)
     double             rate_;
     DoneCb             done_;
     std::atomic<bool>  running_{false};

@@ -145,10 +145,13 @@ TEST(MixedPool, AllFourPlutosAcceptDualChannelTask) {
 
     std::set<std::string> devs;
     for (int i = 0; i < 4; ++i) {
-        // 2 RX + 2 TX task, well within Pluto's 70MHz-6GHz / 2ch capability
+        // 2 RX task, well within Pluto's 70MHz-6GHz / 2ch capability (2 RX
+        // already rules out the 1-channel RTL-SDRs). TX is no longer requested:
+        // the controller never opened TX streams, so it now rejects tx_count>0
+        // instead of advertising a dead TX port (audit RM-58).
         auto resp = rm.tryAccept(makeContinuousRequest(
             "pluto-task-" + std::to_string(i), 433e6 + i * 100e6, 8e6, 10e6,
-            /*rx*/2, /*tx*/2));
+            /*rx*/2, /*tx*/0));
         ASSERT_TRUE(resp.accepted) << "Pluto task " << i << " rejected: " << resp.reject_reason;
         ASSERT_FALSE(resp.streams.empty());
         devs.insert(resp.streams[0].device_id);
@@ -258,7 +261,7 @@ TEST(MixedPool, AllSixDevicesServeOneTaskEach) {
 
     for (int i = 0; i < 4; ++i) {
         auto resp = rm.tryAccept(makeContinuousRequest(
-            "pluto-" + std::to_string(i), 433e6 + i * 100e6, 8e6, 10e6, 2, 2));
+            "pluto-" + std::to_string(i), 433e6 + i * 100e6, 8e6, 10e6, 2, 0));   // RM-58: no TX
         ASSERT_TRUE(resp.accepted) << "pluto task " << i << ": " << resp.reject_reason;
         devs.insert(resp.streams[0].device_id);
     }
@@ -273,7 +276,7 @@ TEST(MixedPool, AllSixDevicesServeOneTaskEach) {
 
     // 7th task (another Pluto-class request) must be rejected — all exclusive
     // CONTINUOUS slots are taken.
-    auto extra = rm.tryAccept(makeContinuousRequest("extra", 915e6, 8e6, 10e6, 2, 2));
+    auto extra = rm.tryAccept(makeContinuousRequest("extra", 915e6, 8e6, 10e6, 2, 0));
     EXPECT_FALSE(extra.accepted);
     EXPECT_EQ(extra.reject_code, RejectCode::NO_DEVICE_AVAILABLE);
 }

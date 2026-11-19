@@ -77,7 +77,10 @@ private:
     std::thread        heartbeat_thread_;  ///< Publishes TASK_STATUS heartbeats.
 
     std::mutex               snapshot_mu_;
-    std::vector<std::thread> snapshot_threads_; ///< In-flight snapshot threads; joined in stop().
+    /// In-flight snapshot threads. Finished ones are joined when the next
+    /// snapshot arrives (they used to accumulate until stop() — CTRL-01).
+    struct SnapshotThread { std::thread t; std::shared_ptr<std::atomic<bool>> done; };
+    std::vector<SnapshotThread> snapshot_threads_;
 
     std::chrono::steady_clock::time_point start_time_;
 

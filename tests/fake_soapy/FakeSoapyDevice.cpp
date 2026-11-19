@@ -14,6 +14,8 @@ Contact author for permission: https://github.com/OpenRFStack
 #include "FakeSoapyDevice.hpp"
 #include <SoapySDR/Registry.hpp>
 #include <stdexcept>
+#include <mutex>
+#include <string>
 
 // ── Global control variable definitions ──────────────────────────────────────
 namespace FakeSoapy {
@@ -25,6 +27,23 @@ namespace FakeSoapy {
     std::atomic<float>  sample_value     {0.0f};
     std::atomic<double> reported_temp    {25.0};
     std::atomic<int>    read_delay_us    {500};  // 0.5 ms — throttles IQStreamer threads
+    std::atomic<float>  channel_step     {0.0f};
+    std::atomic<double> tone_hz          {0.0};
+    std::atomic<float>  tone_amplitude   {0.5f};
+    std::atomic<bool>   hw_time          {false};
+    std::atomic<int>    activate_delay_us{0};
+    std::atomic<int>    max_concurrent_reads{0};
+    std::atomic<int>    tx_freq_set_count{0};
+    std::atomic<double> last_rx_rate     {0.0};
+    std::atomic<int>    open_streams     {0};
+    std::atomic<int>    fail_setup_stream_at{-1};
+    std::atomic<int>    setup_stream_calls{0};
+    std::atomic<int>    pipeline_reads   {0};
+    std::atomic<int>    fail_setup_stream_count{0};
+    static std::mutex   g_args_mu;
+    static std::string  g_last_args;
+    std::string lastMakeArgs() { std::lock_guard lk(g_args_mu); return g_last_args; }
+    void setLastMakeArgs(std::string a) { std::lock_guard lk(g_args_mu); g_last_args = std::move(a); }
 
     void reset() {
         fail_open       .store(false);
@@ -35,6 +54,20 @@ namespace FakeSoapy {
         sample_value    .store(0.0f);
         reported_temp   .store(25.0);
         read_delay_us   .store(500);
+        channel_step    .store(0.0f);
+        tone_hz         .store(0.0);
+        tone_amplitude  .store(0.5f);
+        hw_time         .store(false);
+        activate_delay_us.store(0);
+        max_concurrent_reads.store(0);
+        tx_freq_set_count.store(0);
+        last_rx_rate    .store(0.0);
+        open_streams    .store(0);
+        fail_setup_stream_at.store(-1);
+        setup_stream_calls.store(0);
+        pipeline_reads  .store(0);
+        fail_setup_stream_count.store(0);
+        setLastMakeArgs("");
     }
 }
 
@@ -50,6 +83,9 @@ static SoapySDR::KwargsList findFake(const SoapySDR::Kwargs&) {
 static SoapySDR::Device* makeFake(const SoapySDR::Kwargs& args) {
     if (FakeSoapy::fail_open.load())
         throw std::runtime_error("FakeSoapy: forced open failure");
+    std::string a;
+    for (auto& [k, v] : args) a += (a.empty() ? "" : ",") + k + "=" + v;
+    FakeSoapy::setLastMakeArgs(a);
     return new FakeSoapyDevice(args);
 }
 

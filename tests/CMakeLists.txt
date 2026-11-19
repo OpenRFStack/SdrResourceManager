@@ -46,6 +46,7 @@ add_executable(sdr_tests
     unit/test_fft_engine.cpp
     unit/test_scan_executor.cpp
     unit/test_trigger_monitor.cpp
+    unit/test_audit_regressions.cpp
     ${CTRL_SRCS}
 )
 
