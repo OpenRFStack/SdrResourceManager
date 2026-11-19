@@ -47,6 +47,7 @@ Contact author for permission: https://github.com/OpenRFStack
 #include <chrono>
 #include <cmath>
 #include <complex>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -1421,6 +1422,116 @@ TEST(AuditRegression, RM71_ScanDwellExcludesTheRetuneDrain)
     // entry's own. Before: the 3 dropped reads came out of the dwell (20 ms).
     const auto span_ms = duration_cast<milliseconds>(last - first).count();
     EXPECT_GE(span_ms, 50) << "middle entry delivered reads over only " << span_ms << " ms";
+}
+
+// Scan of N entries on one device; returns when the task has finished.
+static void runScan(ResourceManager& rm, const std::vector<double>& cfs, int dwell_ms = 20)
+{
+    UdpRx       rx;
+    TaskRequest scan;
+    scan.msg_type             = "TASK_REQUEST_SCAN";
+    scan.request_id           = "hop-scan";
+    scan.task_type            = TaskType::SCAN;
+    scan.rf.rx_count          = 1;
+    scan.streaming.dest_ip    = "127.0.0.1";
+    scan.streaming.dest_ports = {rx.port};
+    ScanParams sp;
+    sp.repeat = false;
+    for (double cf : cfs)
+        sp.entries.push_back(entry(cf, 1e6, dwell_ms));
+    scan.scan_params = sp;
+    auto resp        = rm.tryAccept(scan);
+    ASSERT_TRUE(resp.accepted) << resp.reject_reason;
+    ASSERT_TRUE(waitUntil(
+        [&]
+        {
+            return rm.countByState(TaskState::COMPLETED) == 1;
+        },
+        5000));
+}
+
+// ═══ RM-13 — every RX tune also retuned the (unused) TX LO ═══
+// TX is not streamed (RM-58 rejects tx_count > 0), yet tune() programmed the
+// TX PLL on every scan hop: a second PLL write / remote RPC per entry, and
+// the idle TX LO parked on the RX frequency (LO leakage into the RX band).
+TEST(AuditRegression, RM13_ScanDoesNotMoveTheTxLo)
+{
+    FakeSoapy::reset();
+    ResourceManager rm(cfgA(1, 46'480, 46'499), noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 1);
+    FakeSoapy::tx_freq_set_count.store(0);
+    FakeSoapy::rx_freq_set_count.store(0);
+    runScan(rm, {100e6, 200e6, 300e6, 400e6, 500e6});
+    EXPECT_GE(FakeSoapy::rx_freq_set_count.load(), 5);
+    EXPECT_EQ(FakeSoapy::tx_freq_set_count.load(), 0)
+        << "TX LO programmed " << FakeSoapy::tx_freq_set_count.load() << "x for an RX-only scan";
+}
+
+// ═══ RM-73 — tuneChannel() re-programmed an unchanged sample rate per hop ═══
+// shared_lo=false devices (RTL-SDR, HackRF, B210) take the per-channel path:
+// setSampleRate on every scan entry, although the rate never changes. On
+// many drivers that reconfigures the ADC / filters and drops samples.
+TEST(AuditRegression, RM73_PerChannelScanSetsTheRateOnce)
+{
+    FakeSoapy::reset();
+    auto cfg                 = cfgA(1, 46'500, 46'519);
+    cfg.devices[0].shared_lo = false;
+    ResourceManager rm(cfg, noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 1);
+    FakeSoapy::rx_rate_set_count.store(0);
+    FakeSoapy::rx_freq_set_count.store(0);
+    runScan(rm, {100e6, 200e6, 300e6, 400e6, 500e6});
+    EXPECT_GE(FakeSoapy::rx_freq_set_count.load(), 5);
+    EXPECT_LE(FakeSoapy::rx_rate_set_count.load(), 1)
+        << "sample rate programmed " << FakeSoapy::rx_rate_set_count.load() << "x at one rate";
+}
+
+// ═══ RM-75 — one global hardware lock serialised setup across all radios ═══
+// hw_activation_mu_ was held for a task's whole hardware setup (and taken by
+// admission's combined retune): a slow open/activate on one radio (USB
+// re-enumeration, SoapyRemote, AD9361 calibration) stalled every other radio.
+TEST(AuditRegression, RM75_SlowActivationOnOneRadioDoesNotBlockAnother)
+{
+    FakeSoapy::reset();
+    FakeSoapy::activate_delay_us.store(800'000);
+    FakeSoapy::activate_delay_calls.store(1);  // only the first activation is slow
+    FakeSoapy::activate_delay_limited.store(true);
+    ResourceManager rm(cfgA(2, 46'520, 46'539), noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 2);
+    UdpRx a_rx, b_rx;
+    auto  a              = continuousReq("slow", 915e6, 200e3, 1e6, 1, {a_rx.port});
+    a.rf.required_device = "fake-0";
+    ASSERT_TRUE(rm.tryAccept(a).accepted);
+    std::this_thread::sleep_for(milliseconds(100));  // A is inside activateStream()
+    auto b               = continuousReq("fast", 433e6, 200e3, 1e6, 1, {b_rx.port});
+    b.rf.required_device = "fake-1";
+    const auto t0        = steady_clock::now();
+    ASSERT_TRUE(rm.tryAccept(b).accepted);
+    IqPacketHeader                   h{};
+    std::vector<std::complex<float>> iq;
+    ASSERT_TRUE(b_rx.recv(h, iq, 3000));
+    const auto ms = duration_cast<milliseconds>(steady_clock::now() - t0).count();
+    std::printf("RM-75: fake-1 first packet %lld ms after tryAccept (fake-0 still activating)\n",
+                (long long)ms);
+    EXPECT_LT(ms, 400) << "fake-1 streamed after " << ms << " ms — waited for fake-0's activation";
+}
+
+// ═══ RM-13 (cost) — AD9361 timing model: a > 100 MHz step re-calibrates ═══
+// With the TX LO following every RX tune, each large scan hop paid the VCO
+// calibration twice (RX and TX PLL). 4 entries alternating 100 / 900 MHz,
+// 280 ms per calibration (Zynq-7020 + AD9361), 5 ms dwells.
+TEST(AuditRegression, RM13_LargeScanHopCalibratesOnlyTheRxPll)
+{
+    FakeSoapy::reset();
+    FakeSoapy::tune_delay_us.store(15);
+    FakeSoapy::tune_cal_delay_us.store(280'000);
+    ResourceManager rm(cfgA(1, 46'540, 46'559), noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 1);
+    const auto t0 = steady_clock::now();
+    runScan(rm, {900e6, 100e6, 900e6, 100e6}, 5);
+    const auto ms = duration_cast<milliseconds>(steady_clock::now() - t0).count();
+    std::printf("RM-13: 4 large-step scan hops took %lld ms\n", (long long)ms);
+    EXPECT_LT(ms, 1700) << "≈ 2 PLL calibrations per hop (TX LO retuned too)";
 }
 
 /*

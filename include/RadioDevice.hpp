@@ -31,6 +31,7 @@ Contact author for permission: https://github.com/OpenRFStack
 #include <SoapySDR/Device.hpp>
 
 #include <atomic>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
@@ -209,9 +210,13 @@ private:
     SoapySDR::Device*  dev_ = nullptr;
     std::atomic<bool>  online_{false};
     mutable std::mutex mu_;
-    double             current_cf_                  = 0.0;
-    double             current_rate_                = 0.0;
-    int                consecutive_stream_failures_ = 0;
+    double             current_cf_   = 0.0;
+    double             current_rate_ = 0.0;
+    /// Rate last programmed per RX channel by tuneChannel() (shared_lo=false):
+    /// re-setting an unchanged rate on every scan hop reconfigured the ADC
+    /// path on many drivers (RM-73). Cleared by close().
+    std::map<int, double> ch_rate_;
+    int                   consecutive_stream_failures_ = 0;
     /// Streams set up and not yet closed. reopen() unmakes dev_, which every
     /// IQStreamer / TriggerMonitor on this device holds a raw pointer to — it
     /// must never happen while one is open (RM-69).

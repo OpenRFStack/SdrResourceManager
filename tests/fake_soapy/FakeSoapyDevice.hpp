@@ -57,9 +57,18 @@ public:
     void
     setFrequency(const int dir, const size_t ch, const double f, const SoapySDR::Kwargs&) override
     {
+        // AD9361-style LO model: a hop within 100 MHz is a fast LO write,
+        // a larger step re-runs the VCO / RF calibration (~280 ms on a 7020).
+        const double step = std::abs(f - cf_[dir][ch]);
+        const int    delay =
+            step > 100e6 ? FakeSoapy::tune_cal_delay_us.load() : FakeSoapy::tune_delay_us.load();
+        if (delay > 0)
+            std::this_thread::sleep_for(std::chrono::microseconds(delay));
         cf_[dir][ch] = f;
         if (dir == SOAPY_SDR_TX)
             FakeSoapy::tx_freq_set_count.fetch_add(1);
+        else
+            FakeSoapy::rx_freq_set_count.fetch_add(1);
     }
 
     double getFrequency(const int dir, const size_t ch, const std::string&) const override
@@ -77,7 +86,10 @@ public:
     {
         rate_[dir][ch] = r;
         if (dir == SOAPY_SDR_RX)
+        {
             FakeSoapy::last_rx_rate.store(r);
+            FakeSoapy::rx_rate_set_count.fetch_add(1);
+        }
     }
 
     double getSampleRate(const int dir, const size_t ch) const override
@@ -133,6 +145,11 @@ public:
     int activateStream(SoapySDR::Stream* s, const int, const long long, const size_t) override
     {
         int d = FakeSoapy::activate_delay_us.load();
+        // activate_delay_calls > 0: only the next N calls are slow; once
+        // used up (≤ 0 after a limit was set) the rest are fast.
+        if (FakeSoapy::activate_delay_limited.load()
+            && FakeSoapy::activate_delay_calls.fetch_sub(1) <= 0)
+            d = 0;
         if (d > 0)
             std::this_thread::sleep_for(std::chrono::microseconds(d));
         reinterpret_cast<StreamState*>(s)->samples_since_activate = 0;

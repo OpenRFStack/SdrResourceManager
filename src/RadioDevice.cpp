@@ -166,6 +166,7 @@ void RadioDevice::close()
     // rate the hardware is not running at (RM-70).
     current_cf_   = 0.0;
     current_rate_ = 0.0;
+    ch_rate_.clear();
     open_streams_ = 0;
     if (!claimed_key_.empty())
     {
@@ -204,6 +205,8 @@ bool RadioDevice::tune(double cf_hz, double sr_sps)
         if (std::abs(target_rate - current_rate_) > 1.0)
         {
             dev_->setSampleRate(SOAPY_SDR_RX, 0, target_rate);
+            // The TX rate follows (rare: rate changes only). AD9361-class
+            // parts share one baseband clock chain between RX and TX.
             if (cfg_.caps.tx_channels > 0)
                 dev_->setSampleRate(SOAPY_SDR_TX, 0, target_rate);
             current_rate_ = target_rate;
@@ -211,11 +214,14 @@ bool RadioDevice::tune(double cf_hz, double sr_sps)
         }
 
         // Pure LO hop — single IIO write, settles in ~25 µs on AD9361.
+        // RX only (RM-13): TX is never streamed (tx_count > 0 is rejected,
+        // RM-58), so moving the TX PLL with every hop cost a second PLL write
+        // (an extra RPC on SoapyRemote) per scan entry and parked the idle TX
+        // LO on the RX frequency, where its leakage lands in the RX band.
         dev_->setFrequency(SOAPY_SDR_RX, 0, cf_hz);
-        if (cfg_.caps.tx_channels > 0)
-            dev_->setFrequency(SOAPY_SDR_TX, 0, cf_hz);
         current_cf_ = cf_hz;
-        spdlog::info(
+        // debug: a scan logs this once per entry (hundreds per second).
+        spdlog::debug(
             "[{}] Tuned {:.3f} MHz {:.3f} MSPS", cfg_.id, cf_hz / 1e6, current_rate_ / 1e6);
         return true;
     }
@@ -235,7 +241,13 @@ bool RadioDevice::tuneChannel(int ch, double cf_hz, double sr_sps)
     {
         size_t c = static_cast<size_t>(ch);
         dev_->setFrequency(SOAPY_SDR_RX, c, cf_hz);
-        dev_->setSampleRate(SOAPY_SDR_RX, c, sr_sps);
+        // Only when it changes (RM-73): this runs on every scan hop.
+        auto it = ch_rate_.find(ch);
+        if (it == ch_rate_.end() || std::abs(it->second - sr_sps) > 1.0)
+        {
+            dev_->setSampleRate(SOAPY_SDR_RX, c, sr_sps);
+            ch_rate_[ch] = sr_sps;
+        }
         spdlog::debug(
             "[{}] ch{} tuned {:.3f}MHz {:.3f}MSPS", cfg_.id, ch, cf_hz / 1e6, sr_sps / 1e6);
         return true;

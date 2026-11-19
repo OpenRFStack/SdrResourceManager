@@ -24,9 +24,11 @@ Contact author for permission: https://github.com/OpenRFStack
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cmath>
 #include <set>
 #include <string>
+#include <thread>
 
 using namespace sdr;
 using namespace std::chrono;
@@ -101,6 +103,19 @@ static AppConfig makeMixedConfig()
     }
 
     return cfg;
+}
+
+template <typename Pred>
+static bool waitUntil(Pred p, int timeout_ms)
+{
+    const auto dl = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < dl)
+    {
+        if (p())
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return p();
 }
 
 static TaskRequest makeContinuousRequest(const std::string& req_id,
@@ -231,13 +246,17 @@ TEST(MixedPool, BothRtlSdrsAcceptSingleChannelTask)
     std::set<std::string> devs;
     for (int i = 0; i < 2; ++i)
     {
-        // 1 RX / 0 TX task within RTL-SDR's 24MHz-1.766GHz capability
+        // 1 RX / 0 TX task within RTL-SDR's 24MHz-1.766GHz capability. Named
+        // device: selection is devices.xml order / least allocated, so an
+        // unnamed request lands on the (earlier, idle) Plutos.
         auto resp = rm.tryAccept(makeContinuousRequest("rtl-task-" + std::to_string(i),
                                                        100e6 + i * 50e6,
                                                        2e6,
                                                        2.4e6,
                                                        /*rx*/ 1,
-                                                       /*tx*/ 0));
+                                                       /*tx*/ 0,
+                                                       /*rank*/ 1,
+                                                       "rtlsdr-" + std::to_string(i)));
         ASSERT_TRUE(resp.accepted) << "RTL task " << i << " rejected: " << resp.reject_reason;
         ASSERT_FALSE(resp.streams.empty());
         EXPECT_EQ(resp.streams[0].channel_index, 0);
@@ -271,7 +290,16 @@ TEST(MixedPool, RtlSdrClampsBelowFloorRateInsteadOfRejecting)
     ASSERT_TRUE(resp.accepted) << "rejected: " << resp.reject_reason;
     ASSERT_FALSE(resp.streams.empty());
 
-    double acquired = resp.streams[0].sample_rate_sps;
+    // The response describes the delivered stream (ANA-01): 50 kHz. The
+    // device itself acquires at the floor-clearing multiple.
+    EXPECT_DOUBLE_EQ(resp.streams[0].sample_rate_sps, 50e3);
+    ASSERT_TRUE(waitUntil(
+        []
+        {
+            return FakeSoapy::last_rx_rate.load() > 0.0;
+        },
+        2000));
+    double acquired = FakeSoapy::last_rx_rate.load();
     EXPECT_GE(acquired, 225001.0) << "device must be acquiring at/above its floor";
     // Must be an exact integer multiple of the requested rate so the Ddc
     // hands back precisely 50kHz, not an approximation.

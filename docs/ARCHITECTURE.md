@@ -37,9 +37,21 @@ main.cpp
 | ScanExecutor thread (per scan task) | event-driven | Dwell timer; calls `RadioDevice::retune()` + `IQStreamer::updateCenterFreq()` |
 | TriggerMonitor thread (per triggered task) | continuous | `readStream()` → RMS check → gate IQStreamer |
 
-All public `ResourceManager` methods take `std::lock_guard<std::mutex> lock(mu_)` at entry.
-The single registry mutex (`reg_mu_`) protects the task registry separately from the
-scheduling mutex (`mu_`) to avoid holding the big lock during SoapySDR I/O.
+Locks (always taken in this order): `accept_mu_` (admission — one `tryAccept()` decision at a
+time) → **per-radio hardware locks** → `reg_mu_` (task registry, timelines) / `rt_mu_` (live
+runtimes, `channel_states_`).
+
+The hardware locks serialise SoapySDR setup and teardown (`tune` / `openRxStream` /
+`activateStream` / `deactivateStream` / `closeStream`) on **one radio**: activation, deactivation,
+snapshots and combined-window retunes on different radios run in parallel. A task spanning several
+radios (coherent group) takes its radios' locks in device-id order, so two multi-radio tasks cannot
+deadlock; shutdown takes them one radio at a time. They are held only for the setup/teardown calls,
+never for a task's RUNNING lifetime. (They used to be one global mutex: an 800 ms activation on one
+radio delayed a second radio's first packet to 701 ms — now 1 ms, RM-75.)
+
+Callbacks that run on a task's own thread (scan / trigger done, IQStreamer error) are counted in
+`activations_in_flight_`; `closeDevices()` waits for them, so the RM is never destroyed under a
+finishing scan.
 
 **Rank preemption locking**: `tryPreemptConflicting()` acquires `reg_mu_` briefly to
 snapshot the task IDs to preempt, then releases it before calling `deactivateTask()`
@@ -489,6 +501,10 @@ behavior through `FakeSoapy::` atomics:
 | `sample_value` | constant I/Q fill value (used to set RMS for TriggerMonitor) |
 | `reported_temp` | value returned by `readSensor("temp0")` |
 | `read_delay_us` | µs sleep inside `readStream()` to throttle IQStreamer threads |
+| `activate_delay_us` (+ `activate_delay_calls` / `activate_delay_limited`) | µs sleep inside `activateStream()`, optionally only for the next N calls |
+| `tune_delay_us` / `tune_cal_delay_us` | AD9361-style `setFrequency()` cost: LO hop (step ≤ 100 MHz) / VCO calibration (> 100 MHz, ~280 ms on a Zynq-7020) |
+| `pipeline_reads` | reads in the driver pipeline: samples carry the LO set N reads earlier |
+| `tx_freq_set_count` / `rx_freq_set_count` / `rx_rate_set_count` | driver-call counters |
 
 Call `FakeSoapy::reset()` at the start of each test to restore defaults.
 

@@ -49,6 +49,16 @@ jobs:
           ctest --test-dir build --output-on-failure -V --timeout 60 \
             -E "RtlSdr|LimeSdr|UsrpB210|HackRf|PlutoSdr|IndepLo_Continuous|PreferredChannel_SharedLo_SameFreq|HundredDevices1000Rps|CombinedWindow"
 
+      - name: Run device-profile tests (fake driver)
+        # The RtlSdr / HackRf / LimeSdr / UsrpB210 / PlutoSdr / MixedPool
+        # suites run on the fake Soapy driver with each radio's capability
+        # profile; only the PlutoSdr temperature tests need hardware (they
+        # skip themselves). Excluded from the main run by name, these never
+        # ran in CI — two MixedPool tests had been failing unnoticed.
+        run: |
+          ctest --test-dir build --output-on-failure --timeout 120 \
+            -R "RtlSdr|LimeSdr|UsrpB210|HackRf|PlutoSdr|MixedPool" -E "StressTest"
+
       - name: Run CombinedWindow tests (isolated process)
         # These tests start IQStreamers and have a teardown race when run
         # sequentially with other RM tests — run in their own process.

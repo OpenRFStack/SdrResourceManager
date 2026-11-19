@@ -28,7 +28,9 @@ Contact author for permission: https://github.com/OpenRFStack
  * All public methods are safe to call from multiple threads.  Two mutexes are used:
  * - `reg_mu_` — guards the task registry and SpectrumTimelines.
  * - `rt_mu_` — guards live runtime objects (IQStreamers, ScanExecutors, etc.).
- * - `hw_activation_mu_` — serialises SoapySDR open/close across background activation threads.
+ * - per-device hardware locks (`lockHw()`) — serialise SoapySDR setup/teardown on one radio;
+ *   a task spanning several radios takes them in device-id order. Lock order:
+ *   `accept_mu_` → hardware locks → `reg_mu_` / `rt_mu_`.
  */
 #include "ConfigParser.hpp"
 #include "FftEngine.hpp"
@@ -223,12 +225,21 @@ private:
     mutable std::mutex                           rt_mu_;
     std::unordered_map<std::string, TaskRuntime> runtimes_;
 
-    /// Serialises SoapySDR open and close calls (tune/openRxStream/activateStream/
-    /// deactivateStream/closeStream) across background activation/deactivation
-    /// threads. Held only for the duration of those calls — NOT for a task's
-    /// entire RUNNING lifetime — so independent-LO channels on the same device
-    /// can run concurrently once setup completes.
-    std::mutex hw_activation_mu_;
+    /// Per-device hardware locks: serialise SoapySDR setup / teardown
+    /// (tune/openRxStream/activateStream/deactivateStream/closeStream) on ONE
+    /// radio across activation/deactivation/snapshot/combine threads. Held only
+    /// for those calls — not for a task's RUNNING lifetime. Was one global
+    /// mutex: a slow open on one radio stalled every other radio (RM-75).
+    /// Entries are created on first use and never erased (stable references).
+    std::mutex                                                   hw_map_mu_;
+    std::unordered_map<std::string, std::unique_ptr<std::mutex>> hw_mu_;
+    std::mutex& hwMutex(const std::string& device_id);
+
+    /// Hardware locks held for a set of devices; release() / destructor unlock.
+    using HwLocks = std::vector<std::unique_lock<std::mutex>>;
+    /// Lock the hardware of @p device_ids (deduplicated, taken in sorted order
+    /// so multi-radio tasks cannot deadlock each other).
+    HwLocks lockHw(std::vector<std::string> device_ids);
 
     /// Number of detached activateTask() background threads currently running.
     /// closeDevices() waits for this to reach zero before closing devices, so

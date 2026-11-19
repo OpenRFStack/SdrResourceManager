@@ -41,7 +41,9 @@ extern std::atomic<float>  tone_amplitude;
 // When true, readStream sets SOAPY_SDR_HAS_TIME and reports
 // timeNs = samples_since_activate · 1e9 / fs.
 extern std::atomic<bool> hw_time;
-extern std::atomic<int>  activate_delay_us;  // µs sleep inside activateStream
+extern std::atomic<int>  activate_delay_us;       // µs sleep inside activateStream
+extern std::atomic<int>  activate_delay_calls;    // with activate_delay_limited: only the next N
+extern std::atomic<bool> activate_delay_limited;  //   activateStream calls sleep activate_delay_us
 // setupStream() throws on the N-th call (0-based, counted across all fake
 // devices); -1 = never. Lets a test fail one board of a multi-board task.
 extern std::atomic<int> fail_setup_stream_at;
@@ -58,6 +60,10 @@ extern std::atomic<int> fail_setup_stream_count;
 // Observations (written by the fake, read by tests).
 extern std::atomic<int> max_concurrent_reads;  // peak simultaneous readStream calls on one device
 extern std::atomic<int> tx_freq_set_count;     // setFrequency(SOAPY_SDR_TX, …) calls
+extern std::atomic<int> rx_rate_set_count;     // setSampleRate(SOAPY_SDR_RX, …) calls
+extern std::atomic<int> rx_freq_set_count;     // setFrequency(SOAPY_SDR_RX, …) calls
+extern std::atomic<int> tune_delay_us;         // setFrequency sleep, step <= 100 MHz (LO hop)
+extern std::atomic<int> tune_cal_delay_us;     // setFrequency sleep, step > 100 MHz (VCO cal)
 extern std::atomic<double> last_rx_rate;       // last setSampleRate(SOAPY_SDR_RX, …)
 extern std::atomic<int>    open_streams;       // setupStream − closeStream
 
