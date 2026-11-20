@@ -8,7 +8,7 @@
 ```
 main.cpp
   └─ Controller                 orchestrator; owns the AMQP thread + 3 background threads
-       ├─ AmqpClient            qpid-proton AMQP 1.0; auto-reconnect; async send queue
+       ├─ AmqpClient            qpid-proton AMQP 1.0; auto-reconnect (proton restores links); sends posted on the connection work queue
        ├─ MessageCodec          stateless JSON encode/decode for every msg_type
        └─ ResourceManager       scheduling brain; owns all hardware state
             ├─ SpectrumTimeline (one per device)

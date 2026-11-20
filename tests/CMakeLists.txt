@@ -47,6 +47,7 @@ add_executable(sdr_tests
     unit/test_scan_executor.cpp
     unit/test_trigger_monitor.cpp
     unit/test_audit_regressions.cpp
+    unit/test_amqp_client.cpp
     ${CTRL_SRCS}
 )
 

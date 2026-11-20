@@ -75,6 +75,17 @@ public:
     void on_connection_open(proton::connection& c) override
     {
         spdlog::info("AmqpClient: connected to {}", cfg_.url);
+        parent_.setWorkQueue(&c.work_queue());
+
+        // On a reconnect proton re-opens every link of this connection itself
+        // (request receiver, response/status/health and reply senders), so
+        // the handles below stay valid. Opening them again here added four
+        // links per broker restart and leaked the cached reply senders.
+        if (c.reconnected())
+        {
+            parent_.onConnected();
+            return;
+        }
 
         // Force ANYCAST routing on queues so Artemis doesn't create MULTICAST
         // addresses, which stall sender credit for ~15 seconds.
@@ -85,7 +96,6 @@ public:
         proton::sender_options resp_sopts;
         resp_sopts.target(proton::target_options().capabilities({proton::symbol("queue")}));
         response_sender_ = c.open_sender(cfg_.response_queue, resp_sopts);
-        reply_senders_.clear();  // links of the previous connection are gone
 
         status_sender_ = c.open_sender(cfg_.status_topic);
         health_sender_ = c.open_sender(cfg_.health_topic);
@@ -267,6 +277,7 @@ void AmqpClient::stop()
 {
     if (!running_.exchange(false))
         return;
+    setWorkQueue(nullptr);  // no new sends into a connection that is going away
     try
     {
         container_->stop();
@@ -304,6 +315,23 @@ void AmqpClient::stop()
     spdlog::info("AmqpClient: stopped");
 }
 
+bool AmqpClient::post(std::function<void()> fn)
+{
+    std::lock_guard lk(send_mu_);
+    if (!wq_)
+        return false;
+    // May be called from any thread (e.g. background snapshot thread);
+    // proton sender objects are only touched on the reactor thread, and the
+    // connection is woken so the frames go out now.
+    return wq_->add(std::move(fn));
+}
+
+void AmqpClient::setWorkQueue(proton::work_queue* wq)
+{
+    std::lock_guard lk(send_mu_);
+    wq_ = wq;
+}
+
 void AmqpClient::sendResponse(const std::string& body, const std::string& reply_to)
 {
     if (!connected_)
@@ -311,45 +339,42 @@ void AmqpClient::sendResponse(const std::string& body, const std::string& reply_
         spdlog::warn("AmqpClient: sendResponse while disconnected");
         return;
     }
-    // May be called from any thread (e.g. background snapshot thread) — schedule
-    // onto the reactor thread via container_->schedule so proton sender objects
-    // are only touched from the reactor thread.
-    container_->schedule(proton::duration(0),
-                         [this, body, reply_to]()
-                         {
-                             if (reply_to.empty() || reply_to == cfg_.response_queue)
-                             {
-                                 handler_->sendOn(handler_->response_sender_, body);
-                             }
-                             else
-                             {
-                                 proton::connection conn = handler_->response_sender_.connection();
-                                 proton::sender     s    = handler_->replySender(conn, reply_to);
-                                 handler_->sendOn(s, body);
-                             }
-                         });
+    post(
+        [this, body, reply_to]()
+        {
+            if (reply_to.empty() || reply_to == cfg_.response_queue)
+            {
+                handler_->sendOn(handler_->response_sender_, body);
+            }
+            else
+            {
+                proton::connection conn = handler_->response_sender_.connection();
+                proton::sender     s    = handler_->replySender(conn, reply_to);
+                handler_->sendOn(s, body);
+            }
+        });
 }
 
 void AmqpClient::sendStatus(const std::string& body)
 {
     if (!connected_)
         return;
-    container_->schedule(proton::duration(0),
-                         [this, body]()
-                         {
-                             handler_->sendOn(handler_->status_sender_, body);
-                         });
+    post(
+        [this, body]()
+        {
+            handler_->sendOn(handler_->status_sender_, body);
+        });
 }
 
 void AmqpClient::sendHealth(const std::string& body)
 {
     if (!connected_)
         return;
-    container_->schedule(proton::duration(0),
-                         [this, body]()
-                         {
-                             handler_->sendOn(handler_->health_sender_, body);
-                         });
+    post(
+        [this, body]()
+        {
+            handler_->sendOn(handler_->health_sender_, body);
+        });
 }
 
 void AmqpClient::onConnected()

@@ -74,7 +74,16 @@ private:
     MessageHandler on_message_;
 
     class Handler;
-    std::unique_ptr<Handler>           handler_;
+    std::unique_ptr<Handler> handler_;
+    // The connection's work queue (RM-87). Sends are posted here rather than
+    // through container::schedule(): a container timer task does not wake
+    // the connection, so a message sent from it sat in proton until the next
+    // inbound frame (a request or a broker heartbeat). Null outside
+    // start()…stop(); guarded by send_mu_ so stop() can retire it.
+    std::mutex                         send_mu_;
+    proton::work_queue*                wq_{nullptr};
+    bool                               post(std::function<void()> fn);
+    void                               setWorkQueue(proton::work_queue* wq);
     std::unique_ptr<proton::container> container_;
     std::thread                        container_thread_;
     std::atomic<bool>                  connected_{false};
