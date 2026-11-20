@@ -1657,16 +1657,18 @@ TEST(AuditRegression, RM77_SampleExactDrainShortensScanEntries)
 
 // Sample-exact drain still drops every stale sample: pipeline one read deep
 // (1024 samples carrying the previous LO), drain exactly 1024.
-TEST(AuditRegression, RM77_SampleDrainDropsTheStaleSamples)
+static int staleLabelledPackets(int tune_cal_delay_us)
 {
     FakeSoapy::reset();
+    FakeSoapy::tune_cal_delay_us.store(tune_cal_delay_us);
     FakeSoapy::pipeline_reads.store(1);
     FakeSoapy::samples_per_read.store(1024);
     FakeSoapy::read_delay_us.store(1000);
     auto cfg                             = cfgA(1, 46'640, 46'659);
     cfg.devices[0].retune_settle_samples = 1024;
     ResourceManager rm(cfg, noopState, noopErr);
-    ASSERT_EQ(rm.openDevices(), 1);
+    if (rm.openDevices() != 1)
+        return -1;
     UdpRx       rx;
     TaskRequest scan;
     scan.msg_type             = "TASK_REQUEST_SCAN";
@@ -1679,7 +1681,8 @@ TEST(AuditRegression, RM77_SampleDrainDropsTheStaleSamples)
     sp.repeat        = false;
     sp.entries       = {entry(100e6, 1e6, 150), entry(300e6, 1e6, 300)};
     scan.scan_params = sp;
-    ASSERT_TRUE(rm.tryAccept(scan).accepted);
+    if (!rm.tryAccept(scan).accepted)
+        return -1;
     IqPacketHeader                   h{};
     std::vector<std::complex<float>> iq;
     int                              labelled_new = 0, wrong = 0;
@@ -1696,7 +1699,25 @@ TEST(AuditRegression, RM77_SampleDrainDropsTheStaleSamples)
                 break;
             }
     }
-    ASSERT_GT(labelled_new, 0);
+    EXPECT_GT(labelled_new, 0);
+    return wrong;
+}
+
+TEST(AuditRegression, RM77_SampleDrainDropsTheStaleSamples)
+{
+    const int wrong = staleLabelledPackets(0);
+    EXPECT_EQ(wrong, 0) << wrong << " packet(s) labelled 300 MHz carried 100 MHz samples";
+}
+
+// ═══ RM-84 — the retune drain was spent during the tune itself ═══
+// The scan armed the drain BEFORE retune(): reads completing during the tune
+// (old LO) used the budget up, and the stale pipeline after it went out
+// labelled with the new CF. A read in flight across a tune counted too.
+// 200 MHz step → 20 ms VCO calibration (AD9361 model), 1 ms reads.
+TEST(AuditRegression, RM84_DrainStartsAfterTheTuneReturns)
+{
+    const int wrong = staleLabelledPackets(20'000);
+    std::printf("RM-84: %d stale packet(s) with a 20 ms calibrating tune\n", wrong);
     EXPECT_EQ(wrong, 0) << wrong << " packet(s) labelled 300 MHz carried 100 MHz samples";
 }
 
@@ -1771,6 +1792,159 @@ TEST(AuditRegression, RM80_TriggerCaptureIncludesThePreTriggerHistory)
         if (std::abs((iq[i].real() - iq[i - 1].real()) - 1e-6f) > 2e-7f)
             ++gaps;
     EXPECT_EQ(gaps, 0) << "prefix and live samples are not contiguous";
+}
+
+// ═══ RM-81 — back-to-back reservations: the next task started under the last ═══
+// Expiry ran only on the 1 s watchdog tick, so task A stayed RUNNING up to a
+// second past its stop_time while B (reserved from that instant on the same
+// radio, 200 ms scheduler tick) activated: B found A's live channel-0 stream
+// and subscribed to it — B's whole capture came from A's frequency, labelled
+// with A's centre frequency. Driven at the Controller's default tick rates.
+TEST(AuditRegression, RM81_BackToBackReservationDoesNotInheritThePreviousTask)
+{
+    FakeSoapy::reset();
+    ResourceManager rm(cfgA(1, 46'700, 46'719), noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 1);
+    UdpRx ra, rb;
+    auto  a         = continuousReq("A", 100e6, 0.8e6, 1e6, 1, {ra.port});
+    a.msg_type      = "TASK_REQUEST_IMMEDIATE";
+    a.schedule_mode = ScheduleMode::IMMEDIATE;
+    a.duration_ms   = 600;
+    auto ra_resp    = rm.tryAccept(a);
+    ASSERT_TRUE(ra_resp.accepted) << ra_resp.reject_reason;
+    int64_t a_stop = 0;
+    for (auto& t : rm.getActiveTasks())
+        if (t.task_id == ra_resp.task_id)
+            a_stop = t.stop_time_ms;
+    ASSERT_GT(a_stop, 0);
+    auto b          = continuousReq("B", 2.4e9, 0.8e6, 1e6, 1, {rb.port});
+    b.msg_type      = "TASK_REQUEST_SCHEDULED";
+    b.schedule_mode = ScheduleMode::SCHEDULED;
+    b.start_time_ms = a_stop;
+    b.end_time_ms   = a_stop + 5000;
+    auto rb_resp    = rm.tryAccept(b);
+    ASSERT_TRUE(rb_resp.accepted) << rb_resp.reject_reason;
+
+    std::atomic<bool> run{true};
+    std::thread       sched(
+        [&]
+        {
+            while (run)
+            {
+                std::this_thread::sleep_for(milliseconds(200));
+                rm.schedulerTick();
+            }
+        });
+    std::thread wd(
+        [&]
+        {
+            while (run)
+            {
+                std::this_thread::sleep_for(milliseconds(1000));
+                rm.watchdogTick();
+            }
+        });
+    auto stateOf = [&](const std::string& id)
+    {
+        for (auto& t : rm.getActiveTasks())
+            if (t.task_id == id)
+                return t.state;
+        return TaskState::COMPLETED;
+    };
+    int64_t a_end     = 0;
+    bool    b_running = false, a_alive_with_b = false, a_seen = false;
+    auto    dl = steady_clock::now() + seconds(4);
+    while (steady_clock::now() < dl && !(a_end && b_running))
+    {
+        const bool a_run = stateOf(ra_resp.task_id) == TaskState::RUNNING;
+        b_running        = stateOf(rb_resp.task_id) == TaskState::RUNNING;
+        a_seen           = a_seen || a_run;  // A activates asynchronously (PENDING first)
+        if (a_seen && !a_run && !a_end)
+            a_end = epochMs();
+        if (a_run && b_running)
+            a_alive_with_b = true;
+        std::this_thread::sleep_for(milliseconds(2));
+    }
+    IqPacketHeader                   h{};
+    std::vector<std::complex<float>> iq;
+    rb.drain(50);
+    const bool   got_b  = rb.recv(h, iq, 1500);
+    const double dev_cf = rm.getDevice("fake-0")->currentCF();
+    run                 = false;
+    sched.join();
+    wd.join();
+    std::printf("RM-81: A ran %lld ms past its stop_time; B packet cf %.0f, radio at %.0f\n",
+                (long long)(a_end - a_stop),
+                got_b ? (double)h.center_freq_hz : 0.0,
+                dev_cf);
+    ASSERT_TRUE(b_running) << "B never started";
+    EXPECT_FALSE(a_alive_with_b) << "B ran while A (whose reservation had ended) still streamed";
+    EXPECT_LT(a_end - a_stop, 400) << "stop_time honoured only at watchdog granularity";
+    ASSERT_TRUE(got_b) << "B delivered nothing";
+    EXPECT_EQ(h.center_freq_hz, (uint64_t)2.4e9) << "B is streaming A's subscription";
+    EXPECT_DOUBLE_EQ(dev_cf, 2.4e9);
+}
+
+// ═══ RM-82 — start / stop quantised to the scheduler tick ═══
+// The scheduler polled every 200 ms: a reservation started up to a tick late.
+// It now sleeps until the next start or stop_time.
+TEST(AuditRegression, RM82_SchedulerWakesAtTheNextStartOrStop)
+{
+    FakeSoapy::reset();
+    ResourceManager rm(cfgA(1, 46'720, 46'739), noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 1);
+    EXPECT_EQ(rm.msUntilNextEvent(200), 200) << "idle: the full tick";
+    auto r          = continuousReq("S", 100e6, 0.8e6, 1e6, 1);
+    r.msg_type      = "TASK_REQUEST_SCHEDULED";
+    r.schedule_mode = ScheduleMode::SCHEDULED;
+    r.start_time_ms = epochMs() + 130;
+    r.end_time_ms   = r.start_time_ms + 170;
+    ASSERT_TRUE(rm.tryAccept(r).accepted);
+    // Drive it the way Controller::schedulerLoop now does.
+    int64_t started = 0, stopped = 0;
+    auto    dl = steady_clock::now() + seconds(2);
+    while (steady_clock::now() < dl && !stopped)
+    {
+        std::this_thread::sleep_for(milliseconds(rm.msUntilNextEvent(200)));
+        rm.schedulerTick();
+        if (!started)
+        {
+            if (waitUntil(
+                    [&]
+                    {
+                        return rm.countByState(TaskState::RUNNING) == 1;
+                    },
+                    50))
+                started = epochMs();
+        }
+        else if (rm.countByState(TaskState::RUNNING) == 0)
+            stopped = epochMs();
+    }
+    std::printf("RM-82: started %lld ms, stopped %lld ms after the requested times\n",
+                (long long)(started - r.start_time_ms),
+                (long long)(stopped - r.end_time_ms));
+    EXPECT_LT(started - r.start_time_ms, 60);
+    EXPECT_LT(stopped - r.end_time_ms, 60);
+}
+
+// ═══ RM-83 — radios opened one after another at startup ═══
+// N network radios took the sum of their connect times before the RM served
+// anything. 4 radios, 300 ms each (fake make() delay).
+TEST(AuditRegression, RM83_RadiosOpenInParallel)
+{
+    FakeSoapy::reset();
+    FakeSoapy::make_delay_us.store(300'000);
+    auto cfg = cfgA(4, 46'740, 46'759);
+    for (size_t i = 0; i < cfg.devices.size(); ++i)  // four distinct units, as in the field
+        cfg.devices[i].uri = "serial=" + std::to_string(i);
+    ResourceManager rm(cfg, noopState, noopErr);
+    const auto      t0 = steady_clock::now();
+    EXPECT_EQ(rm.openDevices(), 4);
+    const auto ms = duration_cast<milliseconds>(steady_clock::now() - t0).count();
+    std::printf("RM-83: 4 radios x 300 ms opened in %lld ms\n", (long long)ms);
+    EXPECT_LT(ms, 1000) << "opened sequentially (4 x 300 ms = 1200)";
+    for (auto& id : rm.deviceIds())  // each is usable
+        EXPECT_TRUE(rm.getDevice(id)->isOnline()) << id;
 }
 
 /*

@@ -134,6 +134,10 @@ public:
 
     /// @brief Start any SCHEDULED tasks whose start_time_ms ≤ now.  Called by Controller.
     void schedulerTick();
+    /// Milliseconds until the next scheduled start or stop_time (0 if one is
+    /// due), at most @p cap_ms: the scheduler sleeps exactly that long, so
+    /// start/stop are not quantised to its tick.
+    int64_t msUntilNextEvent(int64_t cap_ms) const;
     /// @brief Expire any RUNNING tasks whose stop_time_ms ≤ now.  Called by Controller.
     void watchdogTick();
     /// Re-read every online radio's sensors into its cache (background
@@ -319,6 +323,10 @@ private:
     void         pruneTerminalTasks();
 
     void activateTask(const std::string& task_id);
+    /// End tasks on @p devices whose stop_time has passed and wait (bounded)
+    /// until every terminal task there has released its streams, so a task
+    /// reserved from that instant never inherits them (RM-81). False on timeout.
+    bool releasePredecessors(const std::string& task_id, const std::vector<std::string>& devices);
     /// @param async true: claim the terminal state now, tear the hardware
     ///              down on a counted background thread (stop/cancel, RM-17).
     void         deactivateTask(const std::string& task_id,

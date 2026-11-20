@@ -45,6 +45,7 @@ std::atomic<int>    rx_rate_set_count{0};
 std::atomic<int>    rx_freq_set_count{0};
 std::atomic<int>    tune_delay_us{0};
 std::atomic<int>    sensor_delay_us{0};
+std::atomic<int>    make_delay_us{0};
 std::atomic<int>    stream_mtu{1024};
 std::atomic<bool>   realtime_stream{false};
 std::atomic<int>    tune_cal_delay_us{0};
@@ -92,6 +93,7 @@ void reset()
     rx_freq_set_count.store(0);
     tune_delay_us.store(0);
     sensor_delay_us.store(0);
+    make_delay_us.store(0);
     stream_mtu.store(1024);
     realtime_stream.store(false);
     tune_cal_delay_us.store(0);
@@ -123,6 +125,8 @@ static SoapySDR::Device* makeFake(const SoapySDR::Kwargs& args)
     for (auto& [k, v] : args)
         a += (a.empty() ? "" : ",") + k + "=" + v;
     FakeSoapy::setLastMakeArgs(a);
+    if (int d = FakeSoapy::make_delay_us.load(); d > 0)
+        std::this_thread::sleep_for(std::chrono::microseconds(d));
     return new FakeSoapyDevice(args);
 }
 

@@ -30,8 +30,9 @@ main.cpp
 | Thread | Period | Responsibility |
 |--------|--------|---------------|
 | AMQP thread (qpid-proton) | event-driven | Receive/send AMQP messages; calls `Controller::onMessage()`. No driver I/O for STOP / CANCEL (teardown is asynchronous) or HEALTH / TEMP queries (sensor cache) — RM-17. Admission still does a combined-window LO hop and preemption teardown inline |
-| `schedulerLoop` | 200 ms | Start SCHEDULED tasks whose `start_time ≤ now` |
-| `watchdogLoop` | 1000 ms | Expire tasks whose `stop_time ≤ now`; refresh the sensor cache every `sensor_refresh_ms` |
+| `schedulerLoop` | next start / stop_time (≤ `scheduler_tick_ms`) | Sleeps until the earliest SCHEDULED start or RUNNING stop_time (RM-82). End RUNNING tasks whose `stop_time ≤ now` (asynchronous teardown), then start SCHEDULED tasks whose `start_time ≤ now`. An activation first ends any overdue task on its radios and waits (≤ 2 s) until terminal tasks there have released their streams, so back-to-back reservations never share or retune a live stream (RM-81) |
+| `watchdogLoop` | 1000 ms | Backstop expiry of tasks whose `stop_time ≤ now`; refresh the sensor cache every `sensor_refresh_ms` |
+| opener thread (startup, per radio) | one-shot | `openDevices()` opens radios with a `<uri>` concurrently; `<uri>`-less (enumerate-discovered) ones in config order on one thread (RM-83) |
 | teardown thread (per stop / cancel) | one-shot | Release the task's hardware, then its slots / ports; `tryAccept()` waits ≤ 2 s for these on a resource conflict |
 | `heartbeatLoop` | configurable | Publish `DEVICE_HEALTH` + `CONTROLLER_HEALTH` to `sdr.health` |
 | IQStreamer thread (per channel) | continuous | `readStream()` → `sendmsg()` UDP; updates metrics under mutex |
@@ -383,14 +384,20 @@ Key behaviors:
 ```cpp
 for each entry in params.entries (repeat=true → loop forever):
     step_.store(i)
-    for each IQStreamer: pauseForRetune(settle_reads)        // drop the next N reads (RM-65)
+    for each IQStreamer: pauseForRetune(settle_reads)        // mute; arm the drain (RM-65)
     retune_(entry.center_freq_hz, entry.sample_rate_sps)     // RadioDevice::tune()
+    for each IQStreamer: retuneDone()                        // drain counts from here (RM-84)
     for each IQStreamer: updateSampleRate(sr); updateCenterFreq(cf)   // next packet: DWELL_CHANGE
     for each IQStreamer: waitRetuneSettled()                 // 50 ms slices, ≤ 2 s (RM-71)
     wait_cv_.wait_until(now + dwell_ms)                      // stop() wakes it immediately
 
 → done_(task_id, ok = at least one entry tuned)
 ```
+
+While muted every read is dropped without counting; after `retuneDone()` a read that *began*
+before it (straddling the tune) is dropped too, and only reads started on the new LO count toward
+the drain. Arming the count before the tune let old-LO reads that finished during a slow
+(calibrating, up to ~280 ms on an AD9361) tune spend it (RM-84).
 
 `settle_reads` is the device's `<retune_settle_reads>` (default 2; a scan uses the largest of its
 devices). The reads still in the driver pipeline at a retune carry the previous LO, so they are

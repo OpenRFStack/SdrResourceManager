@@ -277,7 +277,12 @@ void Controller::schedulerLoop()
 {
     while (running_.load())
     {
-        if (!sleepResponsive(cfg_.policy.scheduler_tick_ms))
+        // Wake at the next start / stop_time, not just every tick (a
+        // scheduled task used to start up to scheduler_tick_ms late).
+        const int64_t wait = rm_->msUntilNextEvent(cfg_.policy.scheduler_tick_ms);
+        if (wait > 0 && !sleepResponsive((int)wait))
+            break;
+        if (!running_.load())
             break;
         rm_->schedulerTick();
     }

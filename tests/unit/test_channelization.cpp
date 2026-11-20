@@ -355,6 +355,7 @@ TEST(Channelization, WidenedDestConvertedToSubBand)
     //   - new center = 100.25 MHz (covers both 100 MHz and 100.5 MHz)
     //   - new wideband SR = 2 MHz (decim=4 for Task A's 500 kHz output)
     streamer.pauseForRetune(4);
+    streamer.retuneDone();
     streamer.updateCenterFreq(100.25e6);
     streamer.updateSampleRate(2e6);
 

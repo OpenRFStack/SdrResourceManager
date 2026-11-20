@@ -65,6 +65,7 @@ extern std::atomic<int> rx_freq_set_count;     // setFrequency(SOAPY_SDR_RX, …
 extern std::atomic<bool>
     realtime_stream;                    // samples accrue at fs from activation; tag = capture time
 extern std::atomic<int>    stream_mtu;  // getStreamMTU (RM read size), default 1024
+extern std::atomic<int>    make_delay_us;      // Device::make sleep (network radio connect)
 extern std::atomic<int>    sensor_delay_us;    // readSensor sleep (e.g. SoapyRemote RPC)
 extern std::atomic<int>    tune_delay_us;      // setFrequency sleep, step <= 100 MHz (LO hop)
 extern std::atomic<int>    tune_cal_delay_us;  // setFrequency sleep, step > 100 MHz (VCO cal)

@@ -141,6 +141,12 @@ public:
     ///                       reads cost 13 ms per scan entry.
     void pauseForRetune(int settle_reads, int64_t settle_samples = 0);
 
+    /// The hardware retune has returned. Until then (after pauseForRetune())
+    /// every read is dropped without counting toward the drain, and a read
+    /// that began before this call is dropped too: it straddles the tune.
+    /// The drain then counts only reads that started on the new LO (RM-84).
+    void retuneDone();
+
     /// Block until the reads requested by pauseForRetune() have been dropped
     /// (or the streamer stops / @p timeout passes). The scan dwell starts
     /// after this, so it is not eaten by the drain (RM-71). Returns false on
@@ -230,6 +236,8 @@ private:
     std::atomic<bool>               dwell_changed_{false};
     std::atomic<int>                drain_countdown_{0};
     std::atomic<int64_t>            drain_samples_{0};
+    std::atomic<bool>               retune_pending_{false};
+    std::atomic<uint32_t>           retune_gen_{0};
     std::mutex                      prefix_mu_;
     std::vector<std::vector<float>> prefix_;
     std::atomic<uint32_t>           current_sr_hz_{0};

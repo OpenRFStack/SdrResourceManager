@@ -21,6 +21,7 @@ Contact author for permission: https://github.com/OpenRFStack
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <thread>
 #include <unordered_set>
@@ -97,19 +98,55 @@ ResourceManager::~ResourceManager()
 
 int ResourceManager::openDevices()
 {
-    int ok = 0;
-    for (auto& id : device_order_)
+    // In parallel: a network radio's open is a connect + context setup
+    // (often seconds), and SoapySDR's factory runs driver make() calls
+    // concurrently — N radios used to take the sum of their open times.
+    // One opener thread per distinct (driver, uri): identical make()
+    // arguments share SoapySDR's device-cache entry (concurrent makes of
+    // one entry race inside the library), and <uri>-less entries claim
+    // units through enumerate() in config order — each id must keep mapping
+    // to the same physical radio across restarts. Within a group: config order.
+    std::vector<char>                          opened(device_order_.size(), 0);
+    std::map<std::string, std::vector<size_t>> groups;
+    std::vector<std::string>                   group_order;
+    for (size_t i = 0; i < device_order_.size(); ++i)
     {
-        auto& dev = devices_.at(id);
-        if (dev->open())
+        const auto&       dc  = devices_.at(device_order_[i])->config();
+        const std::string key = dc.uri.empty() && dc.driver != "remote"
+                                    ? std::string("\x01discover")
+                                    : dc.driver + "\x01" + dc.uri;
+        if (!groups.count(key))
+            group_order.push_back(key);
+        groups[key].push_back(i);
+    }
+    std::vector<std::thread> openers;
+    for (const auto& key : group_order)
+        openers.emplace_back(
+            [this, &opened, idx = groups[key]]
+            {
+                for (size_t i : idx)
+                {
+                    auto& dev = devices_.at(device_order_[i]);
+                    if (dev->open())
+                    {
+                        opened[i] = 1;
+                        dev->refreshSensors();
+                    }
+                }
+            });
+    for (auto& t : openers)
+        t.join();
+    int ok = 0;
+    for (size_t i = 0; i < device_order_.size(); ++i)
+    {
+        if (opened[i])
         {
             ++ok;
-            dev->refreshSensors();
-            spdlog::info("ResourceManager: opened {}", id);
+            spdlog::info("ResourceManager: opened {}", device_order_[i]);
         }
         else
         {
-            spdlog::warn("ResourceManager: failed to open {}", id);
+            spdlog::warn("ResourceManager: failed to open {}", device_order_[i]);
         }
     }
     return ok;
@@ -1786,6 +1823,7 @@ bool ResourceManager::applyCombined(const CombinePlan& plan, int64_t t_start, in
     for (auto& st : streamers)
     {
         st->pauseForRetune(settle, dev->config().retune_settle_samples);
+        st->retuneDone();  // tuned above: drop reads that straddled it (RM-84)
         st->retuneSubBands(new_cf, new_sr);
         st->updateCenterFreq(new_cf);
         st->updateSampleRate(new_sr);
@@ -1950,6 +1988,21 @@ void ResourceManager::activateTask(const std::string& task_id)
     {
         spdlog::error("activateTask [{}]: no allocations", task_id);
         return;
+    }
+
+    // A reservation that ends where this one begins may still be running
+    // (expiry is a periodic tick) or tearing down: its live stream would be
+    // borrowed below — at its frequency — or the radio retuned under it.
+    {
+        std::vector<std::string> ids;
+        for (const auto& a : rec.allocations)
+            ids.push_back(a.device_id);
+        if (!releasePredecessors(task_id, ids))
+        {
+            deactivateTask(
+                task_id, TaskState::FAILED, "previous task on the radio did not release it");
+            return;
+        }
     }
 
     // Serialize hardware open calls (tune/openRxStream/activateStream) across
@@ -2648,12 +2701,87 @@ void ResourceManager::teardownTask(const std::string&       task_id,
 }
 
 // ── Scheduler / Watchdog ticks ───────────────────────────────────────────
+bool ResourceManager::releasePredecessors(const std::string&              task_id,
+                                          const std::vector<std::string>& devices)
+{
+    auto onDevices = [&](const TaskRecord& r)
+    {
+        for (const auto& a : r.allocations)
+            if (std::find(devices.begin(), devices.end(), a.device_id) != devices.end())
+                return true;
+        return false;
+    };
+    // Only tasks with a runtime can hold a stream: scan those, not the whole
+    // registry (it keeps up to max_terminal_tasks records, and this runs on
+    // every activation).
+    const auto deadline = steady_clock::now() + seconds(2);
+    for (bool first = true;; first = false)
+    {
+        std::vector<std::string> live;
+        {
+            std::lock_guard lk(rt_mu_);
+            for (const auto& [id, rt] : runtimes_)
+                if (id != task_id)
+                    live.push_back(id);
+        }
+        const int64_t            now  = nowMs();
+        bool                     busy = false;
+        std::vector<std::string> overdue;
+        {
+            std::lock_guard lock(reg_mu_);
+            for (const auto& id : live)
+            {
+                auto it = registry_.find(id);
+                if (it == registry_.end() || !onDevices(it->second))
+                    continue;
+                const auto& r = it->second;
+                if (isTerminalState(r.state))
+                    busy = true;  // still tearing down
+                else if (r.state == TaskState::RUNNING && r.stop_time_ms != TIME_INFINITE
+                         && r.stop_time_ms <= now)
+                    overdue.push_back(id);
+            }
+        }
+        if (first && !overdue.empty())
+        {
+            for (auto& id : overdue)
+                deactivateTask(id, TaskState::COMPLETED, "stop_time reached");
+            continue;  // re-check: those teardowns ran synchronously
+        }
+        if (!busy && overdue.empty())
+            return true;
+        if (steady_clock::now() >= deadline)
+            return false;
+        std::this_thread::sleep_for(milliseconds(2));
+    }
+}
+
+int64_t ResourceManager::msUntilNextEvent(int64_t cap_ms) const
+{
+    const int64_t   now  = nowMs();
+    int64_t         next = now + std::max<int64_t>(0, cap_ms);
+    std::lock_guard lock(reg_mu_);
+    for (const auto& [id, r] : registry_)
+    {
+        if (r.state == TaskState::SCHEDULED)
+            next = std::min(next, r.start_time_ms);
+        else if (r.state == TaskState::RUNNING && r.stop_time_ms != TIME_INFINITE)
+            next = std::min(next, r.stop_time_ms);
+    }
+    return std::max<int64_t>(0, next - now);
+}
+
 void ResourceManager::schedulerTick()
 {
     int64_t                  now = nowMs();
     std::vector<std::string> to_activate;
+    std::vector<std::string> to_expire;
     {
         std::lock_guard lock(reg_mu_);
+        for (auto& [id, rec] : registry_)
+            if (rec.state == TaskState::RUNNING && rec.stop_time_ms != TIME_INFINITE
+                && rec.stop_time_ms <= now)
+                to_expire.push_back(id);
         for (auto& [id, rec] : registry_)
             if (rec.state == TaskState::SCHEDULED && rec.start_time_ms <= now)
             {
@@ -2663,6 +2791,10 @@ void ResourceManager::schedulerTick()
                 to_activate.push_back(id);
             }
     }
+    // stop_time at scheduler granularity (it was the 1 s watchdog tick, RM-81);
+    // asynchronous so one slow teardown never delays the other tasks.
+    for (auto& id : to_expire)
+        deactivateTask(id, TaskState::COMPLETED, "stop_time reached", /*async=*/true);
     for (auto& id : to_activate)
     {
         spdlog::info("schedulerTick: activating {}", id);

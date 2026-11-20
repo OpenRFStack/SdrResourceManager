@@ -2406,6 +2406,7 @@ TEST(PlutoSdr, StressTestFullStackTemperature60s)
             {
                 dev->tune(868e6, 10e6);
                 streamer->pauseForRetune(8);
+                streamer->retuneDone();
                 streamer->updateCenterFreq(868e6);
             }
             for (auto& s : dev->listTemperatures())

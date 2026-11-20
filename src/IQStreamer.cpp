@@ -461,6 +461,13 @@ void IQStreamer::pauseForRetune(int settle_reads, int64_t settle_samples)
         drain_samples_.store(0, std::memory_order_release);
         drain_countdown_.store(settle_reads, std::memory_order_release);
     }
+    retune_pending_.store(true, std::memory_order_release);
+}
+
+void IQStreamer::retuneDone()
+{
+    retune_gen_.fetch_add(1, std::memory_order_acq_rel);
+    retune_pending_.store(false, std::memory_order_release);
 }
 
 bool IQStreamer::waitRetuneSettled(std::chrono::milliseconds timeout) const
@@ -468,7 +475,8 @@ bool IQStreamer::waitRetuneSettled(std::chrono::milliseconds timeout) const
     // Polled: a drained read takes ≥ one driver read (≥ ~0.1 ms), so 200 µs
     // granularity costs nothing and keeps the read loop free of a condvar.
     const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (drain_countdown_.load(std::memory_order_acquire) > 0
+    while (retune_pending_.load(std::memory_order_acquire)
+           || drain_countdown_.load(std::memory_order_acquire) > 0
            || drain_samples_.load(std::memory_order_acquire) > 0)
     {
         if (!running_.load(std::memory_order_acquire))
@@ -597,7 +605,8 @@ void IQStreamer::workerLoop()
 
     while (running_.load(std::memory_order_acquire))
     {
-        int ret =
+        const uint32_t gen_at_read = retune_gen_.load(std::memory_order_acquire);
+        int            ret =
             dev_->readStream(stream_, soapy_bufs.data(), (size_t)chunk, flags, hw_ts, 500'000LL);
         const auto t_read = Clock::now();
         if (!running_.load(std::memory_order_acquire))
@@ -706,6 +715,11 @@ void IQStreamer::workerLoop()
             next_ts = ts_stream + (int64_t)std::llround(n * ns_per_sample);
         }
 
+        // Mid-retune, or a read that began before the tune returned: old /
+        // unsettled LO, and not part of the post-tune drain budget (RM-84).
+        if (retune_pending_.load(std::memory_order_acquire)
+            || gen_at_read != retune_gen_.load(std::memory_order_acquire))
+            continue;
         if (int rem = drain_countdown_.load(std::memory_order_acquire); rem > 0)
         {
             drain_countdown_.fetch_sub(1, std::memory_order_release);

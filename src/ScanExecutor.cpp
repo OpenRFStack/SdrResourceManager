@@ -94,7 +94,11 @@ void ScanExecutor::loop()
             for (auto* s : streamers_)
                 if (s && s->isRunning())
                     s->pauseForRetune(settle_reads_, settle_samples_);
-            if (!retune_(e.center_freq_hz, e.sample_rate_sps))
+            const bool tuned = retune_(e.center_freq_hz, e.sample_rate_sps);
+            for (auto* s : streamers_)  // unmute; the drain starts now (RM-84)
+                if (s && s->isRunning())
+                    s->retuneDone();
+            if (!tuned)
             {
                 spdlog::warn("ScanExecutor [{}] retune failed step {} ({:.3f} MHz) — skipping",
                              task_id_,
