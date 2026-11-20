@@ -1784,12 +1784,21 @@ bool ResourceManager::applyCombined(const CombinePlan& plan, int64_t t_start, in
     {
         // Serialize the tune + timeline update against concurrent activateTask()
         // threads on this radio. Released before rt_mu_ (lock order: hw → rt_mu_).
-        auto hw_lock = lockHw({dev_id});
+        auto       hw_lock = lockHw({dev_id});
+        const auto t_tune  = steady_clock::now();
         if (live && !dev->tune(new_cf, new_sr))
         {
             spdlog::warn("applyCombined: tune failed on {}", dev_id);
             return false;
         }
+        // This runs under the admission lock: every other request (any radio)
+        // waits for it. A combined window moves the LO by less than its width
+        // (no VCO calibration), so this should be an LO hop + rate change —
+        // the warning shows when a driver makes it expensive.
+        if (const auto ms = duration_cast<milliseconds>(steady_clock::now() - t_tune).count();
+            live && ms >= 20)
+            spdlog::warn(
+                "applyCombined: retune on {} took {} ms under the admission lock", dev_id, ms);
         // Only the slots sharing this window — future reservations elsewhere
         // keep their own CF/SR (RM-63).
         tl->updateDeviceTune(new_cf, new_sr, t_start, t_stop);
