@@ -2857,12 +2857,32 @@ void ResourceManager::watchdogTick()
         {
             if (!dev->isOnline())
             {
-                spdlog::info("watchdogTick: retrying open for offline device {}", id);
-                if (dev->open())
+                // On its own thread: a reconnect to a network radio that is
+                // down can take seconds, and this thread also keeps the sensor
+                // cache fresh for every other radio (RM-85). One attempt per
+                // radio at a time; counted so closeDevices() waits for it.
                 {
-                    dev->refreshSensors();
-                    spdlog::info("watchdogTick: {} came online", id);
+                    std::lock_guard lk(reopen_mu_);
+                    if (!reopening_.insert(id).second)
+                        continue;  // previous attempt still running
                 }
+                spdlog::info("watchdogTick: retrying open for offline device {}", id);
+                activations_in_flight_.fetch_add(1, std::memory_order_relaxed);
+                std::thread(
+                    [this, id, d = dev.get()]
+                    {
+                        if (d->open())
+                        {
+                            d->refreshSensors();
+                            spdlog::info("watchdogTick: {} came online", id);
+                        }
+                        {
+                            std::lock_guard lk(reopen_mu_);
+                            reopening_.erase(id);
+                        }
+                        activations_in_flight_.fetch_sub(1, std::memory_order_release);
+                    })
+                    .detach();
             }
         }
     }

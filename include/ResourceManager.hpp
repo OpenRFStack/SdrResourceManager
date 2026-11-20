@@ -49,6 +49,7 @@ Contact author for permission: https://github.com/OpenRFStack
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -270,6 +271,9 @@ private:
     // Timestamp of the last attempt to open offline devices. Zero on init
     // so the first watchdog tick always runs the retry.
     std::chrono::steady_clock::time_point last_device_open_attempt_{};
+    /// Radios with a background reconnect in flight (RM-85), under reopen_mu_.
+    std::mutex                            reopen_mu_;
+    std::set<std::string>                 reopening_;
     std::chrono::steady_clock::time_point last_sensor_refresh_{};  ///< watchdog thread only
 
     TaskResponse doAcceptStandard(const TaskRequest& req);

@@ -1652,7 +1652,9 @@ TEST(AuditRegression, RM77_SampleExactDrainShortensScanEntries)
     const auto samples_ms = scanWallMs(4096);  // 4 k stale samples
     std::printf(
         "RM-77: 10-entry scan %lld ms (2 reads) vs %lld ms (4096 samples)\n", reads_ms, samples_ms);
-    EXPECT_LT(samples_ms, reads_ms * 3 / 4);
+    // ≈ 0.57 in release builds; sanitizer overhead (per-read cost the same in
+    // both modes) pulls it to ≈ 0.74, so the bound leaves room for that.
+    EXPECT_LT(samples_ms, reads_ms * 17 / 20);
 }
 
 // Sample-exact drain still drops every stale sample: pipeline one read deep
@@ -1945,6 +1947,35 @@ TEST(AuditRegression, RM83_RadiosOpenInParallel)
     EXPECT_LT(ms, 1000) << "opened sequentially (4 x 300 ms = 1200)";
     for (auto& id : rm.deviceIds())  // each is usable
         EXPECT_TRUE(rm.getDevice(id)->isOnline()) << id;
+}
+
+// ═══ RM-85 — an unreachable radio stalled the watchdog ═══
+// Offline radios were re-opened on the watchdog thread, one after another:
+// each connect attempt (seconds for a network radio that is down) froze the
+// sensor-cache refresh and the backstop expiry for every other radio.
+TEST(AuditRegression, RM85_OfflineRadioRetryDoesNotBlockTheWatchdog)
+{
+    FakeSoapy::reset();
+    auto cfg           = cfgA(2, 46'760, 46'779);
+    cfg.devices[1].uri = "serial=1";
+    ResourceManager rm(cfg, noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 2);
+    rm.getDevice("fake-1")->close();
+    ASSERT_FALSE(rm.getDevice("fake-1")->isOnline());
+    FakeSoapy::make_delay_us.store(1'500'000);  // slow (re)connect
+    const auto t0 = steady_clock::now();
+    rm.watchdogTick();  // first tick: retry is due
+    const auto ms = duration_cast<milliseconds>(steady_clock::now() - t0).count();
+    std::printf("RM-85: watchdog tick with a 1.5 s reconnect pending took %lld ms\n",
+                (long long)ms);
+    EXPECT_LT(ms, 300) << "reconnect ran on the watchdog thread";
+    EXPECT_TRUE(waitUntil(
+        [&]
+        {
+            return rm.getDevice("fake-1")->isOnline();
+        },
+        4000))
+        << "background reconnect never completed";
 }
 
 /*

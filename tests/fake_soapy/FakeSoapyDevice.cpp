@@ -107,13 +107,19 @@ void reset()
 }  // namespace FakeSoapy
 
 // ── SoapySDR plugin registration ──────────────────────────────────────────────
-static SoapySDR::KwargsList findFake(const SoapySDR::Kwargs&)
+static SoapySDR::KwargsList findFake(const SoapySDR::Kwargs& args)
 {
     if (FakeSoapy::fail_open.load())
         return {};
     SoapySDR::Kwargs k;
     k["driver"] = "fake";
     k["label"]  = "Fake SDR Device (unit-test)";
+    // Echo the unit's identity, as real drivers return its serial / uri:
+    // SoapySDR::Device::make() caches devices by the find() result, so
+    // without this every "serial=N" fake was the same cached instance.
+    for (const char* key : {"serial", "uri", "addr"})
+        if (auto it = args.find(key); it != args.end())
+            k[key] = it->second;
     return {k};
 }
 
