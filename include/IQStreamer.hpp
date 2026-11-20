@@ -93,6 +93,26 @@ public:
     void start();
     void stop();
 
+    /// Samples to send before the first read of the next start(), one
+    /// interleaved-float vector per channel of the stream (TriggerMonitor's
+    /// pre-trigger ring). They are dated just before that read (RM-80).
+    void setPrefix(std::vector<std::vector<float>> per_channel);
+
+    SoapySDR::Device* soapyDevice() const
+    {
+        return dev_;
+    }
+
+    SoapySDR::Stream* soapyStream() const
+    {
+        return stream_;
+    }
+
+    int channelCount() const
+    {
+        return 1 + (int)cfg_.extra_channels.size();
+    }
+
     bool isRunning() const
     {
         return running_.load(std::memory_order_acquire);
@@ -205,14 +225,16 @@ private:
     SoapySDR::Stream* stream_;
     TaskErrorCb       on_error_;
 
-    std::atomic<bool>     running_{false};
-    std::atomic<double>   current_cf_{0.0};
-    std::atomic<bool>     dwell_changed_{false};
-    std::atomic<int>      drain_countdown_{0};
-    std::atomic<int64_t>  drain_samples_{0};
-    std::atomic<uint32_t> current_sr_hz_{0};
-    std::thread           thread_;
-    Clock::time_point     start_epoch_{};  // used when a consumer has no epoch
+    std::atomic<bool>               running_{false};
+    std::atomic<double>             current_cf_{0.0};
+    std::atomic<bool>               dwell_changed_{false};
+    std::atomic<int>                drain_countdown_{0};
+    std::atomic<int64_t>            drain_samples_{0};
+    std::mutex                      prefix_mu_;
+    std::vector<std::vector<float>> prefix_;
+    std::atomic<uint32_t>           current_sr_hz_{0};
+    std::thread                     thread_;
+    Clock::time_point               start_epoch_{};  // used when a consumer has no epoch
 
     // Both dests_ and subbands_ are protected by dests_mu_.
     mutable std::mutex   dests_mu_;

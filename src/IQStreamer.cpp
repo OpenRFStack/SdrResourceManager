@@ -25,6 +25,7 @@ Contact author for permission: https://github.com/OpenRFStack
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 #include <thread>
 
@@ -442,6 +443,12 @@ void IQStreamer::updateSampleRate(double new_sr_sps)
     current_sr_hz_.store((uint32_t)std::llround(new_sr_sps), std::memory_order_release);
 }
 
+void IQStreamer::setPrefix(std::vector<std::vector<float>> per_channel)
+{
+    std::lock_guard lk(prefix_mu_);
+    prefix_ = std::move(per_channel);
+}
+
 void IQStreamer::pauseForRetune(int settle_reads, int64_t settle_samples)
 {
     if (settle_samples > 0)
@@ -615,21 +622,12 @@ void IQStreamer::workerLoop()
                               errs);
             if (errs >= 20)
             {
+                // Called on this worker thread; the callback must not block
+                // or stop this streamer itself — the RM's hands the teardown
+                // to a thread it has already counted (a thread spawned here
+                // reached the RM only after it might have been destroyed).
                 if (on_error_)
-                {
-                    // Fire callback from a separate thread — calling it directly
-                    // would deadlock: deactivateTask → stop() → join() cannot
-                    // join the calling (worker) thread from itself.
-                    auto cb  = on_error_;
-                    auto tid = cfg_.task_id;
-                    auto msg = std::string(SoapySDR::errToStr(ret));
-                    std::thread(
-                        [cb, tid, msg]()
-                        {
-                            cb(tid, msg);
-                        })
-                        .detach();
-                }
+                    on_error_(cfg_.task_id, std::string(SoapySDR::errToStr(ret)));
                 break;
             }
             continue;
@@ -639,7 +637,34 @@ void IQStreamer::workerLoop()
             errs = 0;
         }
 
-        const int n = ret > 0 ? std::min(ret, chunk) : 0;
+        int n = ret > 0 ? std::min(ret, chunk) : 0;
+
+        // Pre-trigger prefix (RM-80): prepend it to the first read after
+        // start(); the anchor below then dates it just before this read.
+        if (n > 0 && !anchored)
+        {
+            std::vector<std::vector<float>> pre;
+            {
+                std::lock_guard lk(prefix_mu_);
+                pre.swap(prefix_);
+            }
+            const size_t pn = pre.empty() ? 0 : pre[0].size() / 2;
+            if (pn > 0)
+            {
+                for (int c = 0; c < n_ch; ++c)
+                {
+                    auto& b = ch_bufs[(size_t)c];
+                    b.resize((pn + (size_t)chunk) * 2);
+                    std::memmove(b.data() + 2 * pn, b.data(), (size_t)n * 2 * sizeof(float));
+                    if ((size_t)c < pre.size() && pre[(size_t)c].size() >= 2 * pn)
+                        std::memcpy(b.data(), pre[(size_t)c].data(), 2 * pn * sizeof(float));
+                    else
+                        std::fill(b.begin(), b.begin() + (ptrdiff_t)(2 * pn), 0.0f);
+                    soapy_bufs[(size_t)c] = b.data();  // resize may have moved it
+                }
+                n += (int)pn;
+            }
+        }
 
         // ── Time base ─────────────────────────────────────────────────────
         double sr = (double)current_sr_hz_.load(std::memory_order_relaxed);

@@ -46,6 +46,7 @@ std::atomic<int>    rx_freq_set_count{0};
 std::atomic<int>    tune_delay_us{0};
 std::atomic<int>    sensor_delay_us{0};
 std::atomic<int>    stream_mtu{1024};
+std::atomic<bool>   realtime_stream{false};
 std::atomic<int>    tune_cal_delay_us{0};
 std::atomic<int>    open_streams{0};
 std::atomic<int>    fail_setup_stream_at{-1};
@@ -92,6 +93,7 @@ void reset()
     tune_delay_us.store(0);
     sensor_delay_us.store(0);
     stream_mtu.store(1024);
+    realtime_stream.store(false);
     tune_cal_delay_us.store(0);
     open_streams.store(0);
     fail_setup_stream_at.store(-1);

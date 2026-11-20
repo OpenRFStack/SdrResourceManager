@@ -1700,6 +1700,79 @@ TEST(AuditRegression, RM77_SampleDrainDropsTheStaleSamples)
     EXPECT_EQ(wrong, 0) << wrong << " packet(s) labelled 300 MHz carried 100 MHz samples";
 }
 
+// ═══ RM-78 — coherent trigger: the other boards sent stale buffers ═══
+// The monitor reads only the first stream while it waits; the task's other
+// streams (other boards, independent-LO channels) are active but unread, so
+// the driver buffers them. On trigger those streamers began with the oldest
+// buffered samples, dated "now": the boards' captures were offset by the
+// whole wait. Realtime fake: samples accrue at fs and carry their capture
+// time (s since activation); the trigger fires at ~0.22 s (-10 dBFS).
+TEST(AuditRegression, RM78_CoherentTriggerCapturesAreTimeAligned)
+{
+    FakeSoapy::reset();
+    FakeSoapy::realtime_stream.store(true);
+    ResourceManager rm(cfgA(2, 46'660, 46'679), noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 2);
+    UdpRx p0(46'660), p1(46'661), p2(46'662), p3(46'663);
+    auto  t = continuousReq("coh-trig", 915e6, 0.8e6, 1e6, 4, {p0.port, p1.port, p2.port, p3.port});
+    t.msg_type           = "TASK_REQUEST_TRIGGERED";
+    t.task_type          = TaskType::TRIGGERED;
+    t.schedule_mode      = ScheduleMode::IMMEDIATE;
+    t.duration_ms        = 5000;
+    t.rf.coherency_group = "grp";
+    TriggerParams tp;
+    tp.threshold_dbfs  = -10.0;
+    tp.post_trigger_ms = 100;
+    tp.max_captures    = 1;
+    t.trigger_params   = tp;
+    auto resp          = rm.tryAccept(t);
+    ASSERT_TRUE(resp.accepted) << resp.reject_reason;
+    IqPacketHeader                   h{};
+    std::vector<std::complex<float>> a, b;
+    ASSERT_TRUE(p0.recv(h, a, 3000) && !a.empty()) << "board 1 sent nothing";
+    ASSERT_TRUE(p2.recv(h, b, 3000) && !b.empty()) << "board 2 sent nothing";
+    const double ta = a[0].real(), tb = b[0].real();
+    std::printf("RM-78: first captured sample board1 %.3f s, board2 %.3f s\n", ta, tb);
+    EXPECT_NEAR(ta, tb, 0.02) << "board 2's capture starts " << (ta - tb) * 1e3
+                              << " ms earlier: its buffer from the wait";
+}
+
+// ═══ RM-80 — pre_trigger_ms ignored; the triggering block was discarded ═══
+// The capture began with the streamer's first read after the crossing: the
+// burst start (preamble) and the requested pre-trigger history were lost.
+// Realtime fake, tag = capture time; trigger at ~0.224 s, pre 100 ms.
+TEST(AuditRegression, RM80_TriggerCaptureIncludesThePreTriggerHistory)
+{
+    FakeSoapy::reset();
+    FakeSoapy::realtime_stream.store(true);
+    ResourceManager rm(cfgA(1, 46'680, 46'699), noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 1);
+    UdpRx rx;
+    auto  t         = continuousReq("pre-trig", 915e6, 0.8e6, 1e6, 1, {rx.port});
+    t.msg_type      = "TASK_REQUEST_TRIGGERED";
+    t.task_type     = TaskType::TRIGGERED;
+    t.schedule_mode = ScheduleMode::IMMEDIATE;
+    t.duration_ms   = 5000;
+    TriggerParams tp;
+    tp.threshold_dbfs  = -10.0;
+    tp.pre_trigger_ms  = 100;
+    tp.post_trigger_ms = 100;
+    tp.max_captures    = 1;
+    t.trigger_params   = tp;
+    ASSERT_TRUE(rm.tryAccept(t).accepted);
+    std::vector<std::complex<float>> iq;
+    IqPacketHeader                   h{};
+    ASSERT_TRUE(rx.collect(20'000, iq, h));
+    const double t0 = iq.front().real();
+    std::printf("RM-80: capture starts at %.3f s (trigger ~0.224 s, pre 100 ms)\n", t0);
+    EXPECT_NEAR(t0, 0.124, 0.01) << "pre-trigger history missing";
+    int gaps = 0;
+    for (size_t i = 1; i < iq.size(); ++i)
+        if (std::abs((iq[i].real() - iq[i - 1].real()) - 1e-6f) > 2e-7f)
+            ++gaps;
+    EXPECT_EQ(gaps, 0) << "prefix and live samples are not contiguous";
+}
+
 /*
 ========================================================================
 End of file — OpenRFStack

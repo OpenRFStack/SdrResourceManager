@@ -153,6 +153,7 @@ public:
         if (d > 0)
             std::this_thread::sleep_for(std::chrono::microseconds(d));
         reinterpret_cast<StreamState*>(s)->samples_since_activate = 0;
+        reinterpret_cast<StreamState*>(s)->t_activate = std::chrono::steady_clock::now();
         return 0;
     }
 
@@ -184,7 +185,7 @@ public:
                    const size_t      numElems,
                    int&              flags,
                    long long&        timeNs,
-                   const long) override
+                   const long        timeoutUs) override
     {
         auto* st = reinterpret_cast<StreamState*>(stream);
         // Concurrency probe: two threads inside readStream on the same
@@ -205,6 +206,44 @@ public:
                 c.fetch_sub(1);
             }
         } leave{in_read_};
+
+        // Realtime model: the radio produces samples at fs from activation
+        // whether or not anyone reads; a read returns the OLDEST buffered
+        // ones (as real drivers do) and blocks until some are there.
+        if (FakeSoapy::realtime_stream.load())
+        {
+            const double r     = rate_[SOAPY_SDR_RX][0].load();
+            const double fs_rt = r > 0.0 ? r : 1e6;
+            const auto   until =
+                std::chrono::steady_clock::now() + std::chrono::microseconds(timeoutUs);
+            long long avail = 0;
+            for (;;)
+            {
+                const double el =
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - st->t_activate)
+                        .count();
+                avail = (long long)(el * fs_rt) - st->samples_since_activate;
+                if (avail > 0 || std::chrono::steady_clock::now() >= until)
+                    break;
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+            }
+            if (avail <= 0)
+                return SOAPY_SDR_TIMEOUT;
+            const size_t n = std::min<size_t>(numElems, (size_t)avail);
+            for (size_t c = 0; c < st->n_ch; ++c)
+            {
+                float* buf = static_cast<float*>(buffs[c]);
+                if (!buf)
+                    continue;
+                for (size_t i = 0; i < n; ++i)  // tag = capture time (s since activation)
+                    buf[2 * i] = buf[2 * i + 1] =
+                        (float)((double)(st->samples_since_activate + (long long)i) / fs_rt);
+            }
+            flags  = 0;
+            timeNs = 0;
+            st->samples_since_activate += (long long)n;
+            return (int)n;
+        }
 
         int delay = FakeSoapy::read_delay_us.load();
         if (delay > 0)
@@ -288,10 +327,11 @@ private:
 
     struct StreamState
     {  // what SoapySDR::Stream* points to
-        size_t              n_ch                   = 1;
-        double              tone_phase             = 0.0;
-        long long           samples_since_activate = 0;
-        std::vector<double> lo_hist;  // pipeline_reads model
+        size_t                                n_ch                   = 1;
+        double                                tone_phase             = 0.0;
+        long long                             samples_since_activate = 0;
+        std::vector<double>                   lo_hist;       // pipeline_reads model
+        std::chrono::steady_clock::time_point t_activate{};  // realtime model
     };
 
     std::mutex                                streams_mu_;

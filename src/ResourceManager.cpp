@@ -1978,11 +1978,20 @@ void ResourceManager::activateTask(const std::string& task_id)
     // start" (ICD §10.1) and must be comparable across boards (RM-30).
     rt.epoch = IQStreamer::Clock::now();
 
+    // Runs on the failing streamer's worker thread: count the teardown
+    // BEFORE that thread exits (closeDevices joins it, then waits for the
+    // count), and tear down elsewhere — deactivateTask joins this streamer.
     auto task_err_cb = [this](const std::string& tid, const std::string& err)
     {
-        InFlight guard(activations_in_flight_);  // streamer thread; see scan_done
         spdlog::error("IQStreamer error task={}: {}", tid, err);
-        deactivateTask(tid, TaskState::FAILED, err);
+        activations_in_flight_.fetch_add(1, std::memory_order_relaxed);
+        std::thread(
+            [this, tid, err]()
+            {
+                deactivateTask(tid, TaskState::FAILED, err);
+                activations_in_flight_.fetch_sub(1, std::memory_order_release);
+            })
+            .detach();
     };
     const auto& streaming = rec.streaming;
 

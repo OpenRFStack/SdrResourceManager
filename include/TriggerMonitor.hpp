@@ -27,6 +27,7 @@ triggers a capture window and decrements the max_captures counter.
 #include <functional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace sdr
@@ -70,14 +71,29 @@ private:
     SoapySDR::Stream*        stream_;
     IQStreamer*              streamer_;
     std::vector<IQStreamer*> also_;  // other streams of the task (coherent capture)
-    double                   rate_;
-    DoneCb                   done_;
-    std::atomic<bool>        running_{false};
-    std::atomic<int>         captures_{0};
-    std::thread              thread_;
-    static constexpr int     BLK = 256;
-    void                     loop();
-    float                    rmsDbfs(const float* b, int n);
+
+    /// Rolling pre-trigger buffer of one stream (all its channels).
+    struct Ring
+    {
+        int                             nch = 1;
+        size_t                          cap = 0, head = 0, size = 0;
+        std::vector<std::vector<float>> buf;
+        void                            init(int channels, size_t capacity);
+        void                            push(void* const* ch, size_t n);
+        std::vector<std::vector<float>> take();  // oldest → newest; empties the ring
+    };
+
+    void                 drainOthers(std::vector<Ring>& rings);
+    double               rate_;
+    DoneCb               done_;
+    std::atomic<bool>    running_{false};
+    std::atomic<int>     captures_{0};
+    std::thread          thread_;
+    static constexpr int BLK = 256;  ///< threshold test granularity (samples)
+    static constexpr int RD =
+        4096;  ///< samples per monitor read (was BLK: ~39 k reads/s at 10 MS/s)
+    void  loop();
+    float rmsDbfs(const float* b, int n);
 };
 }  // namespace sdr
 

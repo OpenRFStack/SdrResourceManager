@@ -416,29 +416,30 @@ hops, but SoapyPlutoSDR exposes no settings (`writeSetting` is empty) — it nee
 ## 9. TriggerMonitor Internals
 
 ```cpp
+rings: one per stream of the task (primary + every other board / channel),
+       pre_trigger_ms × rate + one read, all channels
 while (running_):
-    readStream(BLK=256 samples, timeout=200ms)
+    readStream(primary, RD=4096 samples, timeout=200ms) → ring[0]
+    drain every other stream (non-blocking reads)      → ring[i]   // RM-78
     if TIMEOUT or error: continue
+    for each 256-sample sub-block: rms = 10*log10(sum(i^2+q^2)/N)
+    if no sub-block ≥ threshold: continue
 
-    rms = 10*log10(sum(i^2+q^2)/N)
+    for each streamer: setPrefix(ring[i].take())       // RM-80: history + triggering block
+    start every streamer of the task                   // the streamer is the only reader now
+    sleep post_trigger_ms
+    stop every streamer; captures++
+    if max_captures > 0 and captures >= max_captures: break
 
-    if not triggered:
-        ring.push(block)            // pre-trigger ring buffer
-        if rms >= threshold:
-            triggered = true
-            post_rem = (post_trigger_ms/1000) * rate
-            streamer.start()
-
-    else:  // post-trigger capture
-        post_rem -= n_samples
-        if post_rem <= 0:
-            triggered = false
-            streamer.stop()
-            captures++
-            if max_captures > 0 and captures >= max_captures: break
-
-→ done_(task_id, ok=true)
+→ done_(task_id, ok)
 ```
+
+The pseudo-code above used to describe a ring buffer that did not exist: `pre_trigger_ms` was ignored
+and the block that crossed the threshold was consumed by the monitor, so every capture started after
+the burst began (RM-80, realtime fake: 0.224 s → 0.120 s with 100 ms pre-trigger, contiguous). The
+other streams of a coherent capture were never read while waiting, so their captures began with the
+driver's stale buffer (RM-78: board 2 started 224 ms before board 1). The monitor's channel buffer
+was a single pointer: a 2-channel stream overflowed the stack on every read (RM-79, ASan).
 
 The pre-trigger ring buffer retains blocks but the streamer does not start until
 threshold is crossed — pre-trigger IQ is not currently streamed (reserved for future).
@@ -454,8 +455,10 @@ runs FFTW3 forward DFT, averages power in linear scale, converts to dBFS, and ap
 
 The FFTW3 plan is lazily allocated and reused for the same `fft_size`. If a second
 snapshot requests a different FFT size, the old plan is destroyed and a new one created.
-`FftEngine` is not thread-safe — it must only be called from one thread (the AMQP
-event loop, under the ResourceManager lock).
+`FftEngine::compute()` serialises itself (one mutex around its FFTW buffers / plan): snapshots run on
+their own threads (one per `TASK_REQUEST_SNAPSHOT`, joined by `Controller::stop()`), so two radios'
+snapshots FFT one after the other. The capture itself (tune → read → close) runs in parallel per
+radio under that radio's hardware lock.
 
 ---
 
