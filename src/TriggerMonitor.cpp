@@ -75,9 +75,19 @@ void TriggerMonitor::stop()
 
 float TriggerMonitor::rmsDbfs(const float* b, int n)
 {
+    // 16 fixed lanes: a single running float sum is a serial dependency chain
+    // the compiler may not vectorise without -ffast-math.
+    float     lane[16]{};
+    const int m = n * 2;
+    int       i = 0;
+    for (; i + 16 <= m; i += 16)
+        for (int j = 0; j < 16; ++j)
+            lane[j] += b[i + j] * b[i + j];
     float sq = 0;
-    for (int i = 0; i < n * 2; ++i)
+    for (; i < m; ++i)
         sq += b[i] * b[i];
+    for (float l : lane)
+        sq += l;
     return 10.f * std::log10(sq / (float)n + 1e-30f);
 }
 
