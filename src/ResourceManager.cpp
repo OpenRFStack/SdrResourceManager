@@ -382,7 +382,7 @@ bool ResourceManager::reservePorts(const std::vector<int>& client_ports,
     const int need = n - (int)ports.size();
     if (need > 0)
     {
-        pool_ports = port_pool_->allocateN(need);
+        pool_ports = port_pool_->allocateN(need, ports);
         if ((int)pool_ports.size() < need)
         {
             port_pool_->releaseAll(pool_ports);
@@ -589,10 +589,21 @@ void describeStreams(const TaskRecord::DeviceAllocation&    alloc,
     }
 }
 
+/// Ports [lo, hi) of a reservePorts() result that came from the pool: the
+/// client's ports come first, the pool's after them (RM-88).
+std::vector<int> poolSlice(const std::vector<int>& ports, size_t n_pool, size_t lo, size_t hi)
+{
+    std::vector<int> out;
+    for (size_t i = std::max(lo, ports.size() - std::min(n_pool, ports.size())); i < hi; ++i)
+        out.push_back(ports[i]);
+    return out;
+}
+
 TaskRecord::DeviceAllocation makeAllocation(const RadioDevice& dev,
                                             const FitResult&   fit,
                                             double             requested_sr,
-                                            std::vector<int>   ports)
+                                            std::vector<int>   ports,
+                                            std::vector<int>   pool_ports = {})
 {
     TaskRecord::DeviceAllocation alloc;
     alloc.device_id       = dev.id();
@@ -608,6 +619,7 @@ TaskRecord::DeviceAllocation makeAllocation(const RadioDevice& dev,
     alloc.slice_lo_hz = fit.rf_lo;
     alloc.slice_hi_hz = fit.rf_hi;
     alloc.udp_ports   = std::move(ports);
+    alloc.pool_ports  = std::move(pool_ports);
     return alloc;
 }
 
@@ -930,7 +942,7 @@ TaskResponse ResourceManager::doAcceptStandard(const TaskRequest& req)
     resp.actual_stop_ms  = t_stop;
     resp.accepted        = true;
 
-    auto       alloc     = makeAllocation(*candidate->device, candidate->fit, sr, ports);
+    auto       alloc = makeAllocation(*candidate->device, candidate->fit, sr, ports, pool_ports);
     const bool exclusive = is_scan && candidate->device->config().shared_lo;
     timelines_[alloc.device_id]->insert(
         makeSlot(task_id, t_start, t_stop, alloc, candidate->fit, exclusive));
@@ -1095,8 +1107,10 @@ TaskResponse ResourceManager::acceptCoherent(const TaskRequest&  req,
         const size_t     n = share.fit.avail_rx.size();
         std::vector<int> dev_ports(ports.begin() + (long)port_idx,
                                    ports.begin() + (long)(port_idx + n));
+        auto             dev_pool = poolSlice(ports, pool_ports.size(), port_idx, port_idx + n);
         port_idx += n;
-        auto       alloc     = makeAllocation(*share.dev, share.fit, sr, std::move(dev_ports));
+        auto alloc =
+            makeAllocation(*share.dev, share.fit, sr, std::move(dev_ports), std::move(dev_pool));
         const bool exclusive = opts.exclusive && share.dev->config().shared_lo;
         timelines_[alloc.device_id]->insert(
             makeSlot(task_id, t_start, t_stop, alloc, share.fit, exclusive));
@@ -1496,8 +1510,11 @@ TaskResponse ResourceManager::doAcceptCalibration(const TaskRequest& req)
     {
         std::vector<int> dev_ports(ports.begin() + (long)port_idx,
                                    ports.begin() + (long)(port_idx + fit.avail_rx.size()));
+        auto             dev_pool =
+            poolSlice(ports, pool_ports.size(), port_idx, port_idx + fit.avail_rx.size());
         port_idx += fit.avail_rx.size();
-        auto alloc = makeAllocation(*dev, fit, cp.sample_rate_sps, std::move(dev_ports));
+        auto alloc = makeAllocation(
+            *dev, fit, cp.sample_rate_sps, std::move(dev_ports), std::move(dev_pool));
         timelines_[alloc.device_id]->insert(makeSlot(task_id, t_start, t_stop, alloc, fit, false));
         describeStreams(
             alloc,
@@ -2702,7 +2719,9 @@ void ResourceManager::teardownTask(const std::string&       task_id,
             {
                 if (timelines_.count(alloc.device_id))
                     timelines_[alloc.device_id]->remove(task_id);
-                port_pool_->releaseAll(alloc.udp_ports);
+                // Only the pool's own ports: a client port equal to a pool
+                // port held by another live task freed that task's (RM-88).
+                port_pool_->releaseAll(alloc.pool_ports);
             }
         }
     }

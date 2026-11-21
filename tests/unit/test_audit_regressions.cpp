@@ -1978,6 +1978,56 @@ TEST(AuditRegression, RM85_OfflineRadioRetryDoesNotBlockTheWatchdog)
         << "background reconnect never completed";
 }
 
+// RM-88: teardown returned every port of an allocation to the pool, including
+// ports the client supplied in dest_ports. A client port that equals a pool
+// port held by another live task (a fixed receiver port inside the pool range,
+// on another host) freed that task's port, and the next task was given it too:
+// two streams to one UDP port.
+TEST(AuditRegression, RM88_ClientPortIsNotReleasedIntoThePool)
+{
+    FakeSoapy::reset();
+    ResourceManager rm(cfgA(1, 46'780, 46'789), noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 1);
+    auto b = rm.tryAccept(continuousReq("b", 915e6, 200e3, 250e3, 1));  // pool port
+    ASSERT_TRUE(b.accepted);
+    ASSERT_EQ(b.streams.size(), 1u);
+    const int b_port = b.streams[0].udp_port;
+    EXPECT_EQ(rm.udpPortsUsed(), 1);
+
+    auto a = rm.tryAccept(continuousReq("a", 916e6, 200e3, 250e3, 1, {b_port}));  // client port
+    ASSERT_TRUE(a.accepted);
+    ASSERT_TRUE(rm.stopTask(a.task_id, "a-stop", "done").accepted);
+    std::printf("RM-88: pool ports in use after stopping the client-port task: %d (B still "
+                "running)\n",
+                rm.udpPortsUsed());
+    EXPECT_EQ(rm.udpPortsUsed(), 1) << "B's pool port was released by A's teardown";
+
+    auto c = rm.tryAccept(continuousReq("c", 917e6, 200e3, 250e3, 1));
+    ASSERT_TRUE(c.accepted);
+    ASSERT_EQ(c.streams.size(), 1u);
+    EXPECT_NE(c.streams[0].udp_port, b_port) << "two live tasks stream to the same port";
+    rm.stopTask(b.task_id, "b-stop", "done");
+    rm.stopTask(c.task_id, "c-stop", "done");
+    EXPECT_EQ(rm.udpPortsUsed(), 0);
+}
+
+// RM-89: a request with fewer client ports than channels got the rest from the
+// pool, lowest free first -- which could be the client's own port for channel
+// 0, so two channels of one task streamed to the same socket.
+TEST(AuditRegression, RM89_PoolPortDoesNotDuplicateTheClientsOwnPort)
+{
+    FakeSoapy::reset();
+    ResourceManager rm(cfgA(1, 46'790, 46'799), noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 1);
+    auto r = rm.tryAccept(continuousReq("two", 915e6, 200e3, 250e3, 2, {46'790}));
+    ASSERT_TRUE(r.accepted);
+    ASSERT_EQ(r.streams.size(), 2u);
+    std::printf("RM-89: channel ports %d, %d\n", r.streams[0].udp_port, r.streams[1].udp_port);
+    EXPECT_NE(r.streams[0].udp_port, r.streams[1].udp_port);
+    rm.stopTask(r.task_id, "stop", "done");
+    EXPECT_EQ(rm.udpPortsUsed(), 0);
+}
+
 /*
 ========================================================================
 End of file — OpenRFStack

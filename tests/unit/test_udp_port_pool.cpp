@@ -149,6 +149,15 @@ TEST(UdpPortPool, MinimalTwoPortPool)
     EXPECT_EQ(pool.allocate(), -1);
 }
 
+TEST(UdpPortPool, AllocateNSkipsAvoidedPorts)
+{
+    sdr::UdpPortPool pool(100, 103);
+    auto             ports = pool.allocateN(2, {100, 102});
+    EXPECT_EQ(ports, (std::vector<int>{101, 103}));
+    EXPECT_TRUE(pool.allocateN(1, {100, 102}).empty());  // only avoided ports left
+    EXPECT_EQ(pool.freeCount(), 2);
+}
+
 /*
 ========================================================================
 End of file — OpenRFStack

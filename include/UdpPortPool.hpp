@@ -18,6 +18,7 @@ Contact author for permission: https://github.com/OpenRFStack
 releaseAll() returns them. Used by ResourceManager to assign per-task UDP ports.
  */
 #pragma once
+#include <algorithm>
 #include <mutex>
 #include <set>
 #include <stdexcept>
@@ -49,21 +50,24 @@ public:
         return p;
     }
 
-    std::vector<int> allocateN(int n)
+    /// Take the n lowest free ports, skipping those in @p avoid (the
+    /// request's own client ports: the pool used to hand out a port the
+    /// client had already given for another channel of the same task).
+    std::vector<int> allocateN(int n, const std::vector<int>& avoid = {})
     {
-        std::lock_guard lock(mu_);
-        if ((int)free_.size() < n)
-            return {};
+        std::lock_guard  lock(mu_);
         std::vector<int> out;
-        out.reserve(static_cast<size_t>(n));
-        auto it = free_.begin();
-        for (int i = 0; i < n; ++i, ++it)
-        {
-            out.push_back(*it);
-            used_.insert(*it);
-        }
+        out.reserve(static_cast<size_t>(std::max(n, 0)));
+        for (auto it = free_.begin(); it != free_.end() && (int)out.size() < n; ++it)
+            if (std::find(avoid.begin(), avoid.end(), *it) == avoid.end())
+                out.push_back(*it);
+        if ((int)out.size() < n)
+            return {};
         for (int p : out)
+        {
             free_.erase(p);
+            used_.insert(p);
+        }
         return out;
     }
 
