@@ -53,6 +53,9 @@ Contact author for permission: https://github.com/OpenRFStack
 #include <fstream>
 #include <future>
 #include <limits>
+#include <map>
+#include <random>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -2026,6 +2029,226 @@ TEST(AuditRegression, RM89_PoolPortDoesNotDuplicateTheClientsOwnPort)
     EXPECT_NE(r.streams[0].udp_port, r.streams[1].udp_port);
     rm.stopTask(r.task_id, "stop", "done");
     EXPECT_EQ(rm.udpPortsUsed(), 0);
+}
+
+namespace
+{
+bool isActive(const ResourceManager& rm, const std::string& id)
+{
+    for (auto& t : rm.getActiveTasks())
+        if (t.task_id == id)
+            return true;
+    return false;
+}
+}  // namespace
+
+// RM-91: preemption took the first device in config order where cancelling
+// lower-rank tasks made room, so a rank-2 task on radio 0 was cancelled while
+// a rank-0 task on radio 1 would have freed the same resources.
+TEST(AuditRegression, RM91_PreemptionPicksTheCheapestDevice)
+{
+    FakeSoapy::reset();
+    ResourceManager rm(cfgA(2, 47'000, 47'019), noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 2);
+    auto hi               = continuousReq("hi", 915e6, 1e6, 1e6, 2);
+    hi.rank               = 2;
+    hi.rf.required_device = "fake-0";
+    auto lo               = continuousReq("lo", 915e6, 1e6, 1e6, 2);
+    lo.rank               = 0;
+    lo.rf.required_device = "fake-1";
+    auto rhi = rm.tryAccept(hi), rlo = rm.tryAccept(lo);
+    ASSERT_TRUE(rhi.accepted && rlo.accepted);
+
+    auto big  = continuousReq("big", 2400e6, 1e6, 1e6, 2);  // fits nowhere without preemption
+    big.rank  = 3;
+    auto rbig = rm.tryAccept(big);
+    ASSERT_TRUE(rbig.accepted) << rbig.reject_reason;
+    std::printf("RM-91: after rank-3 request: rank-2 task %s, rank-0 task %s\n",
+                isActive(rm, rhi.task_id) ? "kept" : "PREEMPTED",
+                isActive(rm, rlo.task_id) ? "kept" : "PREEMPTED");
+    EXPECT_TRUE(isActive(rm, rhi.task_id)) << "the higher-rank victim was chosen";
+    EXPECT_FALSE(isActive(rm, rlo.task_id));
+}
+
+// RM-92: victims were added lowest rank first until the request fitted and
+// never pruned, so a lower-rank task that was not in the way was cancelled too.
+TEST(AuditRegression, RM92_PreemptionCancelsOnlyTasksInTheWay)
+{
+    FakeSoapy::reset();
+    auto cfg                 = cfgA(1, 47'020, 47'039);
+    cfg.devices[0].shared_lo = false;  // independent tuners: channels are the resource
+    ResourceManager rm(cfg, noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 1);
+    auto a                 = continuousReq("a", 915e6, 1e6, 1e6, 1);
+    a.rank                 = 0;
+    a.rf.preferred_channel = 0;
+    auto b                 = continuousReq("b", 920e6, 1e6, 1e6, 1);
+    b.rank                 = 1;
+    b.rf.preferred_channel = 1;
+    auto ra = rm.tryAccept(a), rb = rm.tryAccept(b);
+    ASSERT_TRUE(ra.accepted && rb.accepted);
+
+    auto want                 = continuousReq("want", 930e6, 1e6, 1e6, 1);  // needs channel 1
+    want.rank                 = 5;
+    want.rf.preferred_channel = 1;
+    auto rw                   = rm.tryAccept(want);
+    ASSERT_TRUE(rw.accepted) << rw.reject_reason;
+    std::printf("RM-92: rank-0 task on ch0 (not in the way) %s, rank-1 task on ch1 %s\n",
+                isActive(rm, ra.task_id) ? "kept" : "PREEMPTED",
+                isActive(rm, rb.task_id) ? "kept" : "PREEMPTED");
+    EXPECT_TRUE(isActive(rm, ra.task_id)) << "a task that did not block the request was cancelled";
+    EXPECT_FALSE(isActive(rm, rb.task_id));
+}
+
+// RM-93: coherent (multi-radio) requests never preempted: rank was ignored on
+// that path, so a rank-5 DF request was rejected while rank-0 tasks held the
+// group's radios.
+TEST(AuditRegression, RM93_CoherentRequestPreemptsLowerRankAcrossTheGroup)
+{
+    FakeSoapy::reset();
+    ResourceManager rm(cfgA(2, 47'040, 47'059), noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 2);
+    std::vector<std::string> low;
+    for (const char* d : {"fake-0", "fake-1"})
+    {
+        auto r               = continuousReq(std::string("low-") + d, 915e6, 1e6, 1e6, 2);
+        r.rf.required_device = d;
+        auto resp            = rm.tryAccept(r);
+        ASSERT_TRUE(resp.accepted);
+        low.push_back(resp.task_id);
+    }
+    auto df               = continuousReq("df", 2400e6, 1e6, 1e6, 4);
+    df.rf.coherency_group = "grp";
+    df.rank               = 5;
+    auto r                = rm.tryAccept(df);
+    std::printf("RM-93: rank-5 coherent request over 2 busy radios: %s%s\n",
+                r.accepted ? "accepted" : "rejected: ",
+                r.accepted ? "" : r.reject_reason.c_str());
+    ASSERT_TRUE(r.accepted);
+    EXPECT_EQ(r.streams.size(), 4u);
+    EXPECT_FALSE(isActive(rm, low[0]));
+    EXPECT_FALSE(isActive(rm, low[1]));
+    EXPECT_TRUE(waitUntil(
+        [&]
+        {
+            return rm.countByState(TaskState::RUNNING) == 1;
+        },
+        2000))
+        << "coherent task did not start on the freed radios";
+    EXPECT_EQ(FakeSoapy::open_streams.load(), 2) << "one stream per board expected";
+}
+
+TEST(AuditRegression, RM93_CoherentEqualRankDoesNotPreempt)
+{
+    FakeSoapy::reset();
+    ResourceManager rm(cfgA(2, 47'060, 47'079), noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 2);
+    std::vector<std::string> held;
+    for (const char* d : {"fake-0", "fake-1"})
+    {
+        auto r               = continuousReq(std::string("h-") + d, 915e6, 1e6, 1e6, 2);
+        r.rf.required_device = d;
+        r.rank               = 5;
+        held.push_back(rm.tryAccept(r).task_id);
+    }
+    auto df               = continuousReq("df", 2400e6, 1e6, 1e6, 4);
+    df.rf.coherency_group = "grp";
+    df.rank               = 5;
+    EXPECT_FALSE(rm.tryAccept(df).accepted);
+    EXPECT_TRUE(isActive(rm, held[0]));
+    EXPECT_TRUE(isActive(rm, held[1]));
+}
+
+// All or nothing: if one radio's holder outranks the request, nothing is
+// cancelled on the other radio either.
+TEST(AuditRegression, RM93_CoherentPreemptionIsAllOrNothing)
+{
+    FakeSoapy::reset();
+    ResourceManager rm(cfgA(2, 47'080, 47'099), noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 2);
+    auto a               = continuousReq("a", 915e6, 1e6, 1e6, 2);
+    a.rf.required_device = "fake-0";
+    a.rank               = 0;
+    auto b               = continuousReq("b", 915e6, 1e6, 1e6, 2);
+    b.rf.required_device = "fake-1";
+    b.rank               = 9;
+    auto ra = rm.tryAccept(a), rb = rm.tryAccept(b);
+    ASSERT_TRUE(ra.accepted && rb.accepted);
+    auto df               = continuousReq("df", 2400e6, 1e6, 1e6, 4);
+    df.rf.coherency_group = "grp";
+    df.rank               = 5;
+    EXPECT_FALSE(rm.tryAccept(df).accepted);
+    EXPECT_TRUE(isActive(rm, ra.task_id)) << "rank-0 task cancelled for a request that failed";
+    EXPECT_TRUE(isActive(rm, rb.task_id));
+}
+
+// Rank invariants under random multi-radio load (single-radio and coherent
+// requests, random ranks, CFs and channel counts on 4 radios):
+//  1. a task of rank >= the request's is never cancelled by it;
+//  2. a rejected request cancels nothing;
+//  3. a request that cancelled anything was accepted.
+TEST(AuditRegression, RM93_RankInvariantsUnderRandomMultiDeviceLoad)
+{
+    int accepted = 0, rejected = 0, preempting = 0;
+    for (unsigned seed = 1; seed <= 12; ++seed)
+    {
+        FakeSoapy::reset();
+        auto cfg = cfgA(4, 47'100, 47'299);
+        for (size_t i = 0; i < cfg.devices.size(); ++i)
+        {
+            cfg.devices[i].coherency_group = i < 2 ? "grp" : "grp2";
+            cfg.devices[i].shared_lo       = (i % 2) == 0;
+        }
+        ResourceManager rm(cfg, noopState, noopErr);
+        ASSERT_EQ(rm.openDevices(), 4);
+        std::mt19937                       g(seed);
+        std::uniform_int_distribution<int> rank(0, 5), rx(1, 2), band(0, 5), coh(0, 3);
+        const double                       cfs[] = {433e6, 915e6, 1090e6, 1575e6, 2400e6, 5800e6};
+        std::map<std::string, int>         ranks;  // task_id -> rank
+        for (int k = 0; k < 40; ++k)
+        {
+            auto r = continuousReq("r" + std::to_string(k), cfs[band(g)], 500e3, 1e6, rx(g));
+            r.rank = rank(g);
+            if (coh(g) == 0)
+            {
+                r.rf.coherency_group = (k % 2) ? "grp" : "grp2";
+                r.rf.rx_count        = 3;
+            }
+            std::set<std::string> before;
+            for (auto& t : rm.getActiveTasks())
+                before.insert(t.task_id);
+            auto                  resp = rm.tryAccept(r);
+            std::set<std::string> after;
+            for (auto& t : rm.getActiveTasks())
+                after.insert(t.task_id);
+            int cancelled = 0;
+            for (auto& id : before)
+                if (!after.count(id))
+                {
+                    ++cancelled;
+                    EXPECT_LT(ranks[id], r.rank)
+                        << "seed " << seed << " req " << k << ": rank-" << ranks[id]
+                        << " task cancelled by a rank-" << r.rank << " request";
+                }
+            if (!resp.accepted)
+            {
+                ++rejected;
+                EXPECT_EQ(cancelled, 0)
+                    << "seed " << seed << " req " << k << ": a rejected request cancelled tasks";
+            }
+            else
+            {
+                ++accepted;
+                ranks[resp.task_id] = r.rank;
+                preempting += cancelled > 0;
+            }
+        }
+    }
+    std::printf("RM-93 random load: %d accepted (%d by preemption), %d rejected\n",
+                accepted,
+                preempting,
+                rejected);
+    EXPECT_GT(preempting, 0) << "the workload never exercised preemption";
 }
 
 /*

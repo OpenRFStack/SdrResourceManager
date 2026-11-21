@@ -24,6 +24,7 @@ Contact author for permission: https://github.com/OpenRFStack
 #include <map>
 #include <stdexcept>
 #include <thread>
+#include <tuple>
 #include <unordered_set>
 
 namespace sdr
@@ -986,54 +987,126 @@ TaskResponse ResourceManager::acceptCoherent(const TaskRequest&  req,
     };
 
     std::vector<Share> plan;
-    int                remaining = req.rf.rx_count, in_group = 0, online = 0;
+    int                remaining = 0, in_group = 0, online = 0;
     std::string        reasons;
-    for (auto& id : device_order_)
+    // Spread rx_count over the group's radios under fit options `o`.
+    auto planShares = [&](const FitOptions& o)
     {
-        if (remaining <= 0)
-            break;
-        auto& dev = devices_.at(id);
-        if (dev->config().coherency_group != req.rf.coherency_group)
-            continue;
-        ++in_group;
-        if (!dev->isOnline())
+        plan.clear();
+        reasons.clear();
+        remaining = req.rf.rx_count;
+        in_group = online = 0;
+        for (auto& id : device_order_)
         {
-            reasons += " " + id + ": offline;";
-            continue;
-        }
-        ++online;
-        if (!deviceCanServe(*dev, cf, bw, sr, 1, 0) || (extra_ok && !extra_ok(*dev)))
-        {
-            reasons +=
-                " " + id + ": cannot serve " + std::to_string((long long)(cf / 1e6)) + " MHz;";
-            continue;
-        }
-        const double dev_sr = *acquisitionRate(*dev, sr);
-        const auto&  caps   = dev->config().caps;
-        for (int n = std::min(remaining, caps.rx_channels); n >= 1; --n)
-        {
-            auto fit = timelines_.at(id)->canFit(t_start,
-                                                 t_stop,
-                                                 cf,
-                                                 bw,
-                                                 dev_sr,
-                                                 n,
-                                                 0,
-                                                 caps.rx_channels,
-                                                 caps.tx_channels,
-                                                 cfg_.policy.guard_band_hz,
-                                                 dev->config().shared_lo,
-                                                 -1,
-                                                 opts);
-            if (fit.ok)
-            {
-                std::sort(fit.avail_rx.begin(), fit.avail_rx.end());
-                plan.push_back({dev.get(), std::move(fit)});
-                remaining -= n;
+            if (remaining <= 0)
                 break;
+            auto& dev = devices_.at(id);
+            if (dev->config().coherency_group != req.rf.coherency_group)
+                continue;
+            ++in_group;
+            if (!dev->isOnline())
+            {
+                reasons += " " + id + ": offline;";
+                continue;
             }
-            if (n == 1)
-                reasons += " " + id + ": " + fit.reject_reason + ";";
+            ++online;
+            if (!deviceCanServe(*dev, cf, bw, sr, 1, 0) || (extra_ok && !extra_ok(*dev)))
+            {
+                reasons +=
+                    " " + id + ": cannot serve " + std::to_string((long long)(cf / 1e6)) + " MHz;";
+                continue;
+            }
+            const double dev_sr = *acquisitionRate(*dev, sr);
+            const auto&  caps   = dev->config().caps;
+            for (int n = std::min(remaining, caps.rx_channels); n >= 1; --n)
+            {
+                auto fit = timelines_.at(id)->canFit(t_start,
+                                                     t_stop,
+                                                     cf,
+                                                     bw,
+                                                     dev_sr,
+                                                     n,
+                                                     0,
+                                                     caps.rx_channels,
+                                                     caps.tx_channels,
+                                                     cfg_.policy.guard_band_hz,
+                                                     dev->config().shared_lo,
+                                                     -1,
+                                                     o);
+                if (fit.ok)
+                {
+                    std::sort(fit.avail_rx.begin(), fit.avail_rx.end());
+                    plan.push_back({dev.get(), std::move(fit)});
+                    remaining -= n;
+                    break;
+                }
+                if (n == 1)
+                    reasons += " " + id + ": " + fit.reject_reason + ";";
+            }
+        }
+    };
+    planShares(opts);
+
+    // Rank preemption across the group (RM-93): it used to exist only on the
+    // single-device path. Lower-rank tasks on the group's radios are added
+    // lowest rank first until every channel fits, then any that were not in
+    // the way are given back. Nothing is cancelled unless the whole request
+    // then fits.
+    std::vector<std::string> victims;
+    if (remaining > 0 && req.rank > 0)
+    {
+        std::vector<std::pair<int, std::string>> lower;
+        {
+            std::lock_guard lock(reg_mu_);
+            for (auto& id : device_order_)
+            {
+                auto& dev = devices_.at(id);
+                if (dev->config().coherency_group != req.rf.coherency_group || !dev->isOnline())
+                    continue;
+                for (auto& slot : timelines_.at(id)->slotsOverlapping(t_start, t_stop))
+                {
+                    auto it = registry_.find(slot.task_id);
+                    if (it != registry_.end() && !isTerminalState(it->second.state)
+                        && it->second.rank < req.rank)
+                        lower.push_back({it->second.rank, slot.task_id});
+                }
+            }
+        }
+        std::sort(lower.begin(), lower.end());
+        lower.erase(std::unique(lower.begin(), lower.end()), lower.end());
+
+        std::unordered_set<std::string> ignore;
+        if (opts.ignore)
+            ignore = *opts.ignore;
+        FitOptions what_if = opts;
+        what_if.ignore     = &ignore;
+        std::vector<std::pair<int, std::string>> chosen;
+        for (auto& v : lower)
+        {
+            ignore.insert(v.second);
+            chosen.push_back(v);
+            planShares(what_if);
+            if (remaining == 0)
+                break;
+        }
+        if (remaining == 0)
+        {
+            for (size_t i = chosen.size(); i-- > 0;)
+            {
+                ignore.erase(chosen[i].second);
+                planShares(what_if);
+                if (remaining == 0)
+                    chosen.erase(chosen.begin() + (long)i);
+                else
+                    ignore.insert(chosen[i].second);
+            }
+            planShares(what_if);  // plan for the final victim set
+            for (auto& [r, tid] : chosen)
+                victims.push_back(tid);
+        }
+        else
+        {
+            planShares(opts);  // report the real reasons
         }
     }
     if (online == 0)
@@ -1054,7 +1127,8 @@ TaskResponse ResourceManager::acceptCoherent(const TaskRequest&  req,
     }
 
     std::vector<int> ports, pool_ports;
-    if (!reservePorts(req.streaming.dest_ports, req.rf.rx_count, ports, pool_ports))
+    bool have_ports = reservePorts(req.streaming.dest_ports, req.rf.rx_count, ports, pool_ports);
+    if (!have_ports && victims.empty())
     {
         resp.reject_code   = RejectCode::PORT_POOL_EXHAUSTED;
         resp.reject_reason = "UDP port pool exhausted";
@@ -1063,6 +1137,21 @@ TaskResponse ResourceManager::acceptCoherent(const TaskRequest&  req,
 
     // Re-validate every share and insert all of them atomically.
     std::unique_lock<std::mutex> admission(accept_mu_);
+    if (!victims.empty())
+    {
+        applyPreemption(PreemptPlan{"coherency group " + req.rf.coherency_group, victims},
+                        req.rank,
+                        req.request_id);
+        if (!have_ports)  // the victims' ports are free now
+            have_ports =
+                reservePorts(req.streaming.dest_ports, req.rf.rx_count, ports, pool_ports);
+        if (!have_ports)
+        {
+            resp.reject_code   = RejectCode::PORT_POOL_EXHAUSTED;
+            resp.reject_reason = "UDP port pool exhausted";
+            return resp;
+        }
+    }
     for (auto& share : plan)
     {
         const auto& caps = share.dev->config().caps;
@@ -1544,7 +1633,9 @@ std::optional<ResourceManager::PreemptPlan> ResourceManager::planPreemption(
     const TaskRequest& req, int64_t t_start, int64_t t_stop, const FitOptions& opts) const
 {
     const double cf = req.rf.center_freq_hz, bw = req.rf.bandwidth_hz, sr = req.rf.sample_rate_sps;
-    const bool   dev_req = !req.rf.required_device.empty();
+    const bool                    dev_req = !req.rf.required_device.empty();
+    std::optional<PreemptPlan>    best;
+    std::tuple<int, int, int>     best_cost{};
     for (auto& dev_id : device_order_)
     {
         if (dev_req && dev_id != req.rf.required_device)
@@ -1579,30 +1670,65 @@ std::optional<ResourceManager::PreemptPlan> ResourceManager::planPreemption(
         std::unordered_set<std::string> ignore;
         FitOptions                      what_if = opts;
         what_if.ignore                          = &ignore;
-        PreemptPlan plan;
-        plan.device_id = dev_id;
-        for (auto& [rank, tid] : lower)
+        auto fits                               = [&]
         {
-            ignore.insert(tid);
-            plan.victims.push_back(tid);
-            auto fit = tl->canFit(t_start,
-                                  t_stop,
-                                  cf,
-                                  bw,
-                                  dev_sr,
-                                  req.rf.rx_count,
-                                  0,
-                                  caps.rx_channels,
-                                  caps.tx_channels,
-                                  cfg_.policy.guard_band_hz,
-                                  dev->config().shared_lo,
-                                  req.rf.preferred_channel,
-                                  what_if);
-            if (fit.ok)
-                return plan;
+            return tl->canFit(t_start,
+                              t_stop,
+                              cf,
+                              bw,
+                              dev_sr,
+                              req.rf.rx_count,
+                              0,
+                              caps.rx_channels,
+                              caps.tx_channels,
+                              cfg_.policy.guard_band_hz,
+                              dev->config().shared_lo,
+                              req.rf.preferred_channel,
+                              what_if)
+                .ok;
+        };
+        // Grow lowest rank first until the request fits...
+        std::vector<std::pair<int, std::string>> victims;
+        bool                                     ok = false;
+        for (auto& v : lower)
+        {
+            ignore.insert(v.second);
+            victims.push_back(v);
+            if ((ok = fits()))
+                break;
+        }
+        if (!ok)
+            continue;
+        // ...then give back every victim that was not in the way, highest
+        // rank first (it used to cancel all of them, RM-92).
+        for (size_t i = victims.size(); i-- > 0;)
+        {
+            ignore.erase(victims[i].second);
+            if (fits())
+                victims.erase(victims.begin() + (long)i);
+            else
+                ignore.insert(victims[i].second);
+        }
+        // Cheapest device wins: lowest highest-victim rank, then fewest
+        // victims, then lowest rank sum; config order breaks ties. The first
+        // workable device used to be taken (RM-91).
+        int max_rank = 0, sum_rank = 0;
+        for (auto& [r, _] : victims)
+        {
+            max_rank = std::max(max_rank, r);
+            sum_rank += r;
+        }
+        const auto cost = std::make_tuple(max_rank, (int)victims.size(), sum_rank);
+        if (!best || cost < best_cost)
+        {
+            best_cost = cost;
+            best      = PreemptPlan{};
+            best->device_id = dev_id;
+            for (auto& [r, tid] : victims)
+                best->victims.push_back(tid);
         }
     }
-    return std::nullopt;
+    return best;
 }
 
 void ResourceManager::applyPreemption(const PreemptPlan& plan,
