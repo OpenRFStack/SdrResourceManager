@@ -944,8 +944,12 @@ TaskResponse ResourceManager::doAcceptStandard(const TaskRequest& req)
     resp.actual_stop_ms  = t_stop;
     resp.accepted        = true;
 
-    auto       alloc = makeAllocation(*candidate->device, candidate->fit, sr, ports, pool_ports);
-    const bool exclusive = is_scan && candidate->device->config().shared_lo;
+    auto alloc = makeAllocation(*candidate->device, candidate->fit, sr, ports, pool_ports);
+    // A triggered task's stream is read by its trigger monitor and streams
+    // only inside capture windows: nobody may subscribe to it or move its LO
+    // (RM-96), so its slot is exclusive like a scan's.
+    const bool exclusive =
+        (is_scan || req.trigger_params.has_value()) && candidate->device->config().shared_lo;
     timelines_[alloc.device_id]->insert(
         makeSlot(task_id, t_start, t_stop, alloc, candidate->fit, exclusive));
     admission.unlock();
@@ -1176,7 +1180,8 @@ TaskResponse ResourceManager::acceptCoherent(const TaskRequest&  req,
         port_idx += n;
         auto alloc =
             makeAllocation(*share.dev, share.fit, sr, std::move(dev_ports), std::move(dev_pool));
-        const bool exclusive = opts.exclusive && share.dev->config().shared_lo;
+        const bool exclusive = (opts.exclusive || req.trigger_params.has_value())
+                               && share.dev->config().shared_lo;  // RM-96
         timelines_[alloc.device_id]->insert(
             makeSlot(task_id, t_start, t_stop, alloc, share.fit, exclusive));
         describeStreams(
@@ -3073,7 +3078,11 @@ void ResourceManager::teardownTask(const std::string&       task_id,
             }
         }
     }
-    notifyStateChange(task_id);
+    // A second teardown of an already-terminal task (orphaned runtime, or the
+    // trigger/scan done-callback racing a stop) changes no state: publishing
+    // again sent clients the terminal status twice.
+    if (!already_terminal)
+        notifyStateChange(task_id);
 }
 
 // ── Scheduler / Watchdog ticks ───────────────────────────────────────────

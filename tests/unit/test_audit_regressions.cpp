@@ -2363,6 +2363,58 @@ TEST(AuditRegression, RM95_CalibrationPreemptsLowerRank)
     }
 }
 
+// RM-96: a triggered task's channel was advertised as a live shared stream.
+// Another task "subscribed (no hardware change)" to it, but the trigger
+// monitor reads that stream itself and the streamer runs only inside capture
+// windows (stopped again after each, closing every destination socket): the
+// subscriber got no IQ, and under preemption the shared stream's ownership
+// ended in closeStream() on a bad handle (ASan bad-free at 100 req/s mixed
+// load). A triggered task's slot is now exclusive, like a scan's.
+TEST(AuditRegression, RM96_NoTaskSubscribesToATriggeredTasksStream)
+{
+    FakeSoapy::reset();
+    FakeSoapy::sample_value.store(0.01f);  // -40 dBFS: the trigger below never fires
+    ResourceManager rm(cfgA(2, 47'340, 47'359), noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 2);
+    TaskRequest t;
+    t.msg_type               = "TASK_REQUEST_TRIGGERED";
+    t.task_type              = TaskType::TRIGGERED;
+    t.request_id             = "trig";
+    t.schema_version         = "2.0";
+    t.schedule_mode          = ScheduleMode::CONTINUOUS;
+    t.start_time_ms          = epochMs();
+    t.end_time_ms            = TIME_INFINITE;
+    t.rf.center_freq_hz      = 915e6;
+    t.rf.bandwidth_hz        = 200e3;
+    t.rf.sample_rate_sps     = 2e6;
+    t.rf.rx_count            = 1;
+    t.rf.required_device     = "fake-0";
+    t.streaming.dest_ip      = "127.0.0.1";
+    TriggerParams tp;
+    tp.threshold_dbfs = -10.0;
+    t.trigger_params  = tp;
+    ASSERT_TRUE(rm.tryAccept(t).accepted);
+    ASSERT_TRUE(waitUntil(
+        [&]
+        {
+            return rm.countByState(TaskState::RUNNING) == 1;
+        },
+        2000));
+
+    UdpRx rx;
+    auto  req            = continuousReq("c", 915.5e6, 200e3, 250e3, 1, {rx.port});
+    req.rf.required_device = "fake-0";  // the armed trigger's radio, same CF
+    auto c               = rm.tryAccept(req);
+    IqPacketHeader                   h{};
+    std::vector<std::complex<float>> iq;
+    const bool got = c.accepted && rx.recv(h, iq, 1500);
+    std::printf("RM-96: continuous task on the armed trigger's radio: %s, IQ %s\n",
+                c.accepted ? "accepted" : ("rejected: " + c.reject_reason).c_str(),
+                got ? "received" : "none");
+    // Accepted without data = subscribed to the trigger's stopped streamer.
+    EXPECT_TRUE(!c.accepted || got) << "accepted but streams nothing";
+}
+
 /*
 ========================================================================
 End of file — OpenRFStack
