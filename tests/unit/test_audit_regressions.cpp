@@ -2209,10 +2209,21 @@ TEST(AuditRegression, RM93_RankInvariantsUnderRandomMultiDeviceLoad)
         {
             auto r = continuousReq("r" + std::to_string(k), cfs[band(g)], 500e3, 1e6, rx(g));
             r.rank = rank(g);
-            if (coh(g) == 0)
+            const int kind = coh(g);
+            if (kind == 0)
             {
                 r.rf.coherency_group = (k % 2) ? "grp" : "grp2";
                 r.rf.rx_count        = 3;
+            }
+            else if (kind == 1 && (k % 3) == 0)  // calibration over one group (RM-95)
+            {
+                const int rk                     = r.rank;
+                r                                = (k % 2) ? calibrationReq({"fake-0", "fake-1"})
+                                                           : calibrationReq({"fake-2", "fake-3"});
+                r.cal_params->coherency_group    = (k % 2) ? "grp" : "grp2";
+                r.cal_params->rx_count_per_device = 1;
+                r.cal_params->center_freq_hz     = cfs[band(g)];
+                r.rank                           = rk;
             }
             std::set<std::string> before;
             for (auto& t : rm.getActiveTasks())
@@ -2249,6 +2260,107 @@ TEST(AuditRegression, RM93_RankInvariantsUnderRandomMultiDeviceLoad)
                 preempting,
                 rejected);
     EXPECT_GT(preempting, 0) << "the workload never exercised preemption";
+}
+
+// RM-94: a snapshot needed a channel of its own; with every channel busy it
+// was rejected even when a running stream covered the band (mixed load: 59
+// of 71 snapshots rejected). It is now served from that stream: tap + DDC to
+// the requested rate, no retune.
+TEST(AuditRegression, RM94_SnapshotServedFromALiveStreamWhenNoChannelIsFree)
+{
+    FakeSoapy::reset();
+    FakeSoapy::tone_hz.store(300e3);  // +300 kHz in the 2 MS/s window -> 915.3 MHz
+    FakeSoapy::tone_amplitude.store(0.5f);
+    ResourceManager rm(cfgA(1, 47'300, 47'319), noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 1);
+    auto busy = rm.tryAccept(continuousReq("busy", 915e6, 1.6e6, 2e6, 2));  // both channels
+    ASSERT_TRUE(busy.accepted);
+    ASSERT_TRUE(waitUntil(
+        [&]
+        {
+            return rm.countByState(TaskState::RUNNING) == 1;
+        },
+        2000));
+
+    auto snap = [&](double cf)
+    {
+        TaskRequest r;
+        r.msg_type   = "TASK_REQUEST_SNAPSHOT";
+        r.request_id = "snap";
+        r.task_type  = TaskType::SNAPSHOT;
+        SnapshotParams sp;
+        sp.center_freq_hz = cf;
+        sp.bandwidth_hz   = 200e3;
+        sp.sample_rate_sps = 250e3;
+        sp.fft_size        = 1024;
+        sp.n_averages      = 4;
+        r.snapshot_params  = sp;
+        SnapshotResult res;
+        auto           resp = rm.tryAccept(r, &res);
+        return std::make_pair(resp, res);
+    };
+    auto [resp, res] = snap(915.3e6);
+    std::printf("RM-94: snapshot with both channels busy: %s%s\n",
+                resp.accepted ? "accepted" : "rejected: ",
+                resp.accepted ? "" : resp.reject_reason.c_str());
+    ASSERT_TRUE(resp.accepted);
+    ASSERT_TRUE(res.success);
+    ASSERT_EQ(res.power_bins.size(), 1024u);
+    const auto pk = std::max_element(res.power_bins.begin(), res.power_bins.end())
+                    - res.power_bins.begin();
+    const double f_pk = res.freq_axis_start_hz + pk * res.freq_axis_step_hz;
+    std::printf("RM-94: peak at %.4f MHz (tone 915.3000), %.1f dB, rate %.0f S/s\n",
+                f_pk / 1e6,
+                res.power_bins[(size_t)pk],
+                res.sample_rate_sps);
+    EXPECT_NEAR(f_pk, 915.3e6, res.freq_axis_step_hz * 1.5);
+    EXPECT_NEAR(res.sample_rate_sps, 250e3, 1.0);
+    EXPECT_EQ(rm.countByState(TaskState::RUNNING), 1) << "the running task was disturbed";
+
+    EXPECT_FALSE(snap(2400e6).first.accepted) << "outside every running window";
+    rm.stopTask(busy.task_id, "s", "done");
+}
+
+// RM-95: calibration ignored rank: a rank-2 calibration over radios held by
+// rank-0 tasks was rejected ("Device fakerf-2 not free"). It now preempts
+// them, all or nothing; equal rank still does not.
+TEST(AuditRegression, RM95_CalibrationPreemptsLowerRank)
+{
+    for (int holder_rank : {0, 2})
+    {
+        FakeSoapy::reset();
+        ResourceManager rm(cfgA(2, 47'320, 47'339), noopState, noopErr);
+        ASSERT_EQ(rm.openDevices(), 2);
+        std::vector<std::string> held;
+        for (const char* d : {"fake-0", "fake-1"})
+        {
+            auto r               = continuousReq(std::string("h-") + d, 433e6, 1e6, 1e6, 2);
+            r.rf.required_device = d;
+            r.rank               = holder_rank;
+            auto resp            = rm.tryAccept(r);
+            ASSERT_TRUE(resp.accepted);
+            held.push_back(resp.task_id);
+        }
+        auto cal = calibrationReq({"fake-0", "fake-1"});
+        cal.rank = 2;
+        auto r   = rm.tryAccept(cal);
+        std::printf("RM-95: rank-2 calibration over rank-%d holders: %s %s\n",
+                    holder_rank,
+                    r.accepted ? "accepted" : "rejected:",
+                    r.reject_reason.c_str());
+        if (holder_rank < 2)
+        {
+            EXPECT_TRUE(r.accepted);
+            EXPECT_FALSE(isActive(rm, held[0]));
+            EXPECT_FALSE(isActive(rm, held[1]));
+        }
+        else
+        {
+            EXPECT_FALSE(r.accepted);
+            EXPECT_TRUE(isActive(rm, held[0]));
+            EXPECT_TRUE(isActive(rm, held[1]));
+        }
+    }
 }
 
 /*

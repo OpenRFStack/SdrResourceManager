@@ -279,6 +279,11 @@ private:
     TaskResponse doAcceptStandard(const TaskRequest& req);
     TaskResponse doAcceptScan(const TaskRequest& req);
     TaskResponse doAcceptSnapshot(const TaskRequest& req, SnapshotResult* out);
+    /// Serve a snapshot from a running stream whose window covers it (no
+    /// channel free): tap + DDC to the requested rate. nullopt = no such stream.
+    std::optional<TaskResponse> snapshotFromLiveStream(const SnapshotParams& sp,
+                                                       TaskResponse          resp,
+                                                       SnapshotResult*       out);
     TaskResponse doAcceptCalibration(const TaskRequest& req);
 
     struct DeviceCandidate
@@ -360,6 +365,17 @@ private:
                                               int64_t            t_stop,
                                               const FitOptions&  opts) const;
     void applyPreemption(const PreemptPlan& plan, int rank, const std::string& request_id);
+    /// Multi-radio preemption (coherent, calibration): lower-rank tasks on
+    /// @p devs, added lowest rank first until @p fits (with them ignored)
+    /// holds, then pruned to those actually in the way. nullopt = cancelling
+    /// every lower-rank task would still not make room (all or nothing).
+    std::optional<std::vector<std::string>>
+    planGroupPreemption(const std::vector<std::string>&                  devs,
+                        int                                              rank,
+                        int64_t                                          t_start,
+                        int64_t                                          t_stop,
+                        const FitOptions&                                base,
+                        const std::function<bool(const FitOptions&)>&    fits) const;
 
     /// Combined-window plan; applyCombined() performs the retune. Planning has
     /// no side effects, so a request rejected later leaves hardware untouched.

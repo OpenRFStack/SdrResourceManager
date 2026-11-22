@@ -12,6 +12,7 @@ Contact author for permission: https://github.com/OpenRFStack
 */
 #include "ResourceManager.hpp"
 
+#include "Ddc.hpp"
 #include "sdr/MessageCodec.hpp"
 
 #include <spdlog/spdlog.h>
@@ -1055,54 +1056,30 @@ TaskResponse ResourceManager::acceptCoherent(const TaskRequest&  req,
     std::vector<std::string> victims;
     if (remaining > 0 && req.rank > 0)
     {
-        std::vector<std::pair<int, std::string>> lower;
+        std::vector<std::string> group;
+        for (auto& id : device_order_)
+            if (devices_.at(id)->config().coherency_group == req.rf.coherency_group
+                && devices_.at(id)->isOnline())
+                group.push_back(id);
+        auto plan = planGroupPreemption(group,
+                                        req.rank,
+                                        t_start,
+                                        t_stop,
+                                        opts,
+                                        [&](const FitOptions& o)
+                                        {
+                                            planShares(o);
+                                            return remaining == 0;
+                                        });
+        if (plan)
         {
-            std::lock_guard lock(reg_mu_);
-            for (auto& id : device_order_)
-            {
-                auto& dev = devices_.at(id);
-                if (dev->config().coherency_group != req.rf.coherency_group || !dev->isOnline())
-                    continue;
-                for (auto& slot : timelines_.at(id)->slotsOverlapping(t_start, t_stop))
-                {
-                    auto it = registry_.find(slot.task_id);
-                    if (it != registry_.end() && !isTerminalState(it->second.state)
-                        && it->second.rank < req.rank)
-                        lower.push_back({it->second.rank, slot.task_id});
-                }
-            }
-        }
-        std::sort(lower.begin(), lower.end());
-        lower.erase(std::unique(lower.begin(), lower.end()), lower.end());
-
-        std::unordered_set<std::string> ignore;
-        if (opts.ignore)
-            ignore = *opts.ignore;
-        FitOptions what_if = opts;
-        what_if.ignore     = &ignore;
-        std::vector<std::pair<int, std::string>> chosen;
-        for (auto& v : lower)
-        {
-            ignore.insert(v.second);
-            chosen.push_back(v);
-            planShares(what_if);
-            if (remaining == 0)
-                break;
-        }
-        if (remaining == 0)
-        {
-            for (size_t i = chosen.size(); i-- > 0;)
-            {
-                ignore.erase(chosen[i].second);
-                planShares(what_if);
-                if (remaining == 0)
-                    chosen.erase(chosen.begin() + (long)i);
-                else
-                    ignore.insert(chosen[i].second);
-            }
-            planShares(what_if);  // plan for the final victim set
-            for (auto& [r, tid] : chosen)
-                victims.push_back(tid);
+            victims = std::move(*plan);
+            std::unordered_set<std::string> ignore(victims.begin(), victims.end());
+            if (opts.ignore)
+                ignore.insert(opts.ignore->begin(), opts.ignore->end());
+            FitOptions o = opts;
+            o.ignore     = &ignore;
+            planShares(o);  // the plan for the final victim set
         }
         else
         {
@@ -1143,8 +1120,7 @@ TaskResponse ResourceManager::acceptCoherent(const TaskRequest&  req,
                         req.rank,
                         req.request_id);
         if (!have_ports)  // the victims' ports are free now
-            have_ports =
-                reservePorts(req.streaming.dest_ports, req.rf.rx_count, ports, pool_ports);
+            have_ports = reservePorts(req.streaming.dest_ports, req.rf.rx_count, ports, pool_ports);
         if (!have_ports)
         {
             resp.reject_code   = RejectCode::PORT_POOL_EXHAUSTED;
@@ -1317,9 +1293,10 @@ TaskResponse ResourceManager::doAcceptSnapshot(const TaskRequest& req, SnapshotR
 
     // Admission: reserve the device for the capture window, so no task can
     // retune it underneath the snapshot (and vice versa).
-    RadioDevice*      dev     = nullptr;
-    int               snap_ch = 0;
-    const std::string slot_id = "snapshot-" + genUuid();
+    RadioDevice*      dev        = nullptr;
+    int               snap_ch    = 0;
+    bool              no_channel = false;
+    const std::string slot_id    = "snapshot-" + genUuid();
     {
         std::lock_guard admission(accept_mu_);
         FitOptions      opts;
@@ -1337,12 +1314,23 @@ TaskResponse ResourceManager::doAcceptSnapshot(const TaskRequest& req, SnapshotR
                                         false,
                                         opts);
         if (!candidate)
-            return fail(RejectCode::NO_DEVICE_AVAILABLE, "No device available for snapshot");
-        dev        = candidate->device;
-        snap_ch    = candidate->fit.avail_rx[0];
-        auto alloc = makeAllocation(*dev, candidate->fit, sp.sample_rate_sps, {});
-        timelines_[dev->id()]->insert(
-            makeSlot(slot_id, now, now + budget_ms, alloc, candidate->fit, false));
+            no_channel = true;
+        else
+        {
+            dev        = candidate->device;
+            snap_ch    = candidate->fit.avail_rx[0];
+            auto alloc = makeAllocation(*dev, candidate->fit, sp.sample_rate_sps, {});
+            timelines_[dev->id()]->insert(
+                makeSlot(slot_id, now, now + budget_ms, alloc, candidate->fit, false));
+        }
+    }
+    if (no_channel)
+    {
+        // Every channel is busy, but a running stream may already cover the
+        // band: under mixed load 59 of 71 snapshots were rejected (RM-94).
+        if (auto r = snapshotFromLiveStream(sp, resp, out))
+            return *r;
+        return fail(RejectCode::NO_DEVICE_AVAILABLE, "No device available for snapshot");
     }
 
     struct SlotGuard
@@ -1437,6 +1425,105 @@ TaskResponse ResourceManager::doAcceptSnapshot(const TaskRequest& req, SnapshotR
     return resp;
 }
 
+// ── Snapshot from a live stream (RM-94) ─────────────────────────────────
+std::optional<TaskResponse> ResourceManager::snapshotFromLiveStream(const SnapshotParams& sp,
+                                                                    TaskResponse          resp,
+                                                                    SnapshotResult*       out)
+{
+    struct Cand
+    {
+        std::shared_ptr<IQStreamer> s;
+        std::string                 dev;
+        double                      cf, sr;
+    };
+
+    std::vector<Cand> cands;
+    const double      usable = cfg_.policy.usable_bw_fraction;
+    const int64_t     now    = nowMs();
+    {
+        std::lock_guard lk(rt_mu_);
+        for (auto& [key, cs] : channel_states_)
+        {
+            if (!cs.streamer || !cs.streamer->isRunning() || !cs.device || !cs.device->isOnline())
+                continue;
+            const double cf = cs.streamer->currentCF(), sr = cs.streamer->currentSR();
+            if (sr <= 0.0 || sr + 1.0 < sp.sample_rate_sps)
+                continue;  // cannot produce the requested rate
+            const double half = sr * usable / 2.0;
+            if (sp.center_freq_hz - sp.bandwidth_hz / 2.0 < cf - half
+                || sp.center_freq_hz + sp.bandwidth_hz / 2.0 > cf + half)
+                continue;  // band not inside the window
+            if (timelines_.at(cs.device->id())->hasExclusive(now, now + 1))
+                continue;  // a scan moves this LO every dwell
+            cands.push_back({cs.streamer, cs.device->id(), cf, sr});
+        }
+    }
+    // Preferred device first, then the closest rate (least decimation).
+    std::stable_sort(cands.begin(),
+                     cands.end(),
+                     [&](const Cand& a, const Cand& b)
+                     {
+                         const bool pa = a.dev == sp.preferred_device,
+                                    pb = b.dev == sp.preferred_device;
+                         return pa != pb ? pa : a.sr < b.sr;
+                     });
+
+    const int total = sp.fft_size * sp.n_averages;
+    // One deadline for all attempts: a stream that stops delivering (overflow,
+    // stalled driver) must not cost its full budget once per candidate.
+    const auto deadline = steady_clock::now() + milliseconds(1500);
+    for (auto& c : cands)
+    {
+        const int    D      = std::max(1, (int)std::floor(c.sr / sp.sample_rate_sps + 1e-6));
+        const double out_sr = c.sr / D;
+        Ddc          ddc(sp.center_freq_hz - c.cf, c.sr, D);
+        if (!ddc.valid())
+            continue;
+        const int  warm = ddc.numTaps() / D + 2;  // FIR history settling
+        const int  n_in = (total + warm) * D + D;
+        const auto left = duration_cast<milliseconds>(deadline - steady_clock::now());
+        if (left.count() <= 0)
+            break;
+        const auto budget = std::min(
+            left, milliseconds(std::max<int64_t>(250, (int64_t)(4000.0 * n_in / c.sr) + 100)));
+        std::vector<float> raw;
+        double             cf = 0.0, sr = 0.0;
+        const auto         t0 = steady_clock::now();
+        if (!c.s->capture(n_in, raw, cf, sr, budget))
+        {
+            spdlog::warn("Snapshot {:.3f} MHz: live stream on {} gave no clean capture in {} ms",
+                         sp.center_freq_hz / 1e6,
+                         c.dev,
+                         duration_cast<milliseconds>(steady_clock::now() - t0).count());
+            continue;  // stopped / retuned / stalled meanwhile: try the next stream
+        }
+        if (cf != c.cf || sr != c.sr)
+            continue;
+        std::vector<float> dec(((size_t)n_in / (size_t)D + 2) * 2);
+        const int          n_out = ddc.process(raw.data(), n_in, dec.data());
+        if (n_out < total + warm)
+            continue;
+        std::vector<float> buf(dec.begin() + 2 * warm, dec.begin() + 2 * (warm + total));
+        auto               result = fft_engine_->compute(
+            buf, sp.fft_size, sp.n_averages, sp.center_freq_hz, out_sr, sp.bandwidth_hz, c.dev);
+        if (!result.success)
+            continue;
+        spdlog::info("Snapshot {:.3f} MHz served from the live stream on {} ({:.3f} MHz, "
+                     "{:.0f} S/s, decim {})",
+                     sp.center_freq_hz / 1e6,
+                     c.dev,
+                     c.cf / 1e6,
+                     c.sr,
+                     D);
+        if (out)
+            *out = result;
+        resp.accepted = true;
+        resp.task_id  = "snapshot-tap-" + genUuid();
+        return resp;
+    }
+    return std::nullopt;
+}
+
 // ── Calibration task ─────────────────────────────────────────────────────
 TaskResponse ResourceManager::doAcceptCalibration(const TaskRequest& req)
 {
@@ -1511,6 +1598,65 @@ TaskResponse ResourceManager::doAcceptCalibration(const TaskRequest& req)
     int64_t t_stop  = t_start + cp.duration_ms;
 
     // Check all devices are free — and use the channels the timeline says are.
+    // A higher-rank calibration preempts lower-rank tasks on its radios, all
+    // or nothing; it used to be rejected whenever a radio was busy (RM-95).
+    auto fitAll = [&](const FitOptions& o, std::string* why)
+    {
+        for (auto& dev_id : target_devs)
+        {
+            auto*       dev  = devices_.at(dev_id).get();
+            const auto& caps = dev->config().caps;
+            auto        fit  = timelines_.at(dev_id)->canFit(t_start,
+                                                     t_stop,
+                                                     cp.center_freq_hz,
+                                                     cp.bandwidth_hz,
+                                                     *acquisitionRate(*dev, cp.sample_rate_sps),
+                                                     cp.rx_count_per_device,
+                                                     0,
+                                                     caps.rx_channels,
+                                                     caps.tx_channels,
+                                                     cfg_.policy.guard_band_hz,
+                                                     dev->config().shared_lo,
+                                                     -1,
+                                                     o);
+            if (!fit.ok)
+            {
+                if (why)
+                    *why = "Device " + dev_id + " not free: " + fit.reject_reason;
+                return false;
+            }
+        }
+        return true;
+    };
+    std::vector<std::string> victims;
+    std::string              busy_why;
+    if (!fitAll({}, &busy_why) && req.rank > 0)
+    {
+        bool servable = true;
+        for (auto& dev_id : target_devs)
+            servable = servable
+                       && deviceCanServe(*devices_.at(dev_id),
+                                         cp.center_freq_hz,
+                                         cp.bandwidth_hz,
+                                         cp.sample_rate_sps,
+                                         cp.rx_count_per_device,
+                                         0);
+        if (servable)
+            if (auto plan = planGroupPreemption(target_devs,
+                                                req.rank,
+                                                t_start,
+                                                t_stop,
+                                                {},
+                                                [&](const FitOptions& o)
+                                                {
+                                                    return fitAll(o, nullptr);
+                                                }))
+                victims = std::move(*plan);
+    }
+    std::unordered_set<std::string> victim_set(victims.begin(), victims.end());
+    FitOptions                      plan_opts;
+    plan_opts.ignore = &victim_set;
+
     std::vector<std::pair<RadioDevice*, FitResult>> fits;
     for (auto& dev_id : target_devs)
     {
@@ -1538,7 +1684,9 @@ TaskResponse ResourceManager::doAcceptCalibration(const TaskRequest& req)
                                                  caps.rx_channels,
                                                  caps.tx_channels,
                                                  cfg_.policy.guard_band_hz,
-                                                 dev->config().shared_lo);
+                                                 dev->config().shared_lo,
+                                                 -1,
+                                                 plan_opts);
         if (!fit.ok)
         {
             resp.reject_code   = RejectCode::COHERENCY_UNAVAILABLE;
@@ -1551,7 +1699,8 @@ TaskResponse ResourceManager::doAcceptCalibration(const TaskRequest& req)
 
     const int        total_ports = (int)target_devs.size() * cp.rx_count_per_device;
     std::vector<int> ports, pool_ports;
-    if (!reservePorts(req.streaming.dest_ports, total_ports, ports, pool_ports))
+    bool have_ports = reservePorts(req.streaming.dest_ports, total_ports, ports, pool_ports);
+    if (!have_ports && victims.empty())
     {
         resp.reject_code   = RejectCode::PORT_POOL_EXHAUSTED;
         resp.reject_reason = "Port pool exhausted for calibration";
@@ -1565,6 +1714,20 @@ TaskResponse ResourceManager::doAcceptCalibration(const TaskRequest& req)
     resp.actual_stop_ms  = t_stop;
 
     std::unique_lock<std::mutex> admission(accept_mu_);
+    if (!victims.empty())
+    {
+        applyPreemption(PreemptPlan{"calibration", victims}, req.rank, req.request_id);
+        if (!have_ports)
+            have_ports = reservePorts(req.streaming.dest_ports, total_ports, ports, pool_ports);
+        if (!have_ports)
+        {
+            resp.accepted = false;
+            resp.task_id.clear();
+            resp.reject_code   = RejectCode::PORT_POOL_EXHAUSTED;
+            resp.reject_reason = "Port pool exhausted for calibration";
+            return resp;
+        }
+    }
     for (auto& [dev, fit] : fits)
     {
         const auto& caps  = dev->config().caps;
@@ -1633,9 +1796,9 @@ std::optional<ResourceManager::PreemptPlan> ResourceManager::planPreemption(
     const TaskRequest& req, int64_t t_start, int64_t t_stop, const FitOptions& opts) const
 {
     const double cf = req.rf.center_freq_hz, bw = req.rf.bandwidth_hz, sr = req.rf.sample_rate_sps;
-    const bool                    dev_req = !req.rf.required_device.empty();
-    std::optional<PreemptPlan>    best;
-    std::tuple<int, int, int>     best_cost{};
+    const bool   dev_req = !req.rf.required_device.empty();
+    std::optional<PreemptPlan> best;
+    std::tuple<int, int, int>  best_cost{};
     for (auto& dev_id : device_order_)
     {
         if (dev_req && dev_id != req.rf.required_device)
@@ -1672,19 +1835,20 @@ std::optional<ResourceManager::PreemptPlan> ResourceManager::planPreemption(
         what_if.ignore                          = &ignore;
         auto fits                               = [&]
         {
-            return tl->canFit(t_start,
-                              t_stop,
-                              cf,
-                              bw,
-                              dev_sr,
-                              req.rf.rx_count,
-                              0,
-                              caps.rx_channels,
-                              caps.tx_channels,
-                              cfg_.policy.guard_band_hz,
-                              dev->config().shared_lo,
-                              req.rf.preferred_channel,
-                              what_if)
+            return tl
+                ->canFit(t_start,
+                         t_stop,
+                         cf,
+                         bw,
+                         dev_sr,
+                         req.rf.rx_count,
+                         0,
+                         caps.rx_channels,
+                         caps.tx_channels,
+                         cfg_.policy.guard_band_hz,
+                         dev->config().shared_lo,
+                         req.rf.preferred_channel,
+                         what_if)
                 .ok;
         };
         // Grow lowest rank first until the request fits...
@@ -1721,8 +1885,8 @@ std::optional<ResourceManager::PreemptPlan> ResourceManager::planPreemption(
         const auto cost = std::make_tuple(max_rank, (int)victims.size(), sum_rank);
         if (!best || cost < best_cost)
         {
-            best_cost = cost;
-            best      = PreemptPlan{};
+            best_cost       = cost;
+            best            = PreemptPlan{};
             best->device_id = dev_id;
             for (auto& [r, tid] : victims)
                 best->victims.push_back(tid);
@@ -1746,6 +1910,64 @@ void ResourceManager::applyPreemption(const PreemptPlan& plan,
                      request_id);
         deactivateTask(tid, TaskState::CANCELLED, reason);
     }
+}
+
+std::optional<std::vector<std::string>>
+ResourceManager::planGroupPreemption(const std::vector<std::string>&               devs,
+                                     int                                           rank,
+                                     int64_t                                       t_start,
+                                     int64_t                                       t_stop,
+                                     const FitOptions&                             base,
+                                     const std::function<bool(const FitOptions&)>& fits) const
+{
+    std::vector<std::pair<int, std::string>> lower;
+    {
+        std::lock_guard lock(reg_mu_);
+        for (auto& id : devs)
+        {
+            auto tl = timelines_.find(id);
+            if (tl == timelines_.end())
+                continue;
+            for (auto& slot : tl->second->slotsOverlapping(t_start, t_stop))
+            {
+                auto it = registry_.find(slot.task_id);
+                if (it != registry_.end() && !isTerminalState(it->second.state)
+                    && it->second.rank < rank)
+                    lower.push_back({it->second.rank, slot.task_id});
+            }
+        }
+    }
+    std::sort(lower.begin(), lower.end());
+    lower.erase(std::unique(lower.begin(), lower.end()), lower.end());
+
+    std::unordered_set<std::string> ignore;
+    if (base.ignore)
+        ignore = *base.ignore;
+    FitOptions what_if = base;
+    what_if.ignore     = &ignore;
+    std::vector<std::pair<int, std::string>> chosen;
+    bool                                     ok = false;
+    for (auto& v : lower)
+    {
+        ignore.insert(v.second);
+        chosen.push_back(v);
+        if ((ok = fits(what_if)))
+            break;
+    }
+    if (!ok)
+        return std::nullopt;
+    for (size_t i = chosen.size(); i-- > 0;)
+    {
+        ignore.erase(chosen[i].second);
+        if (fits(what_if))
+            chosen.erase(chosen.begin() + (long)i);
+        else
+            ignore.insert(chosen[i].second);
+    }
+    std::vector<std::string> out;
+    for (auto& [r, tid] : chosen)
+        out.push_back(tid);
+    return out;
 }
 
 // ── Combined-window retune ───────────────────────────────────────────────

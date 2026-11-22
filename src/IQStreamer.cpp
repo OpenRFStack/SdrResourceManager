@@ -403,6 +403,10 @@ void IQStreamer::stop()
 {
     if (!running_.exchange(false, std::memory_order_acq_rel))
         return;
+    {
+        std::lock_guard lk(tap_mu_);  // wake a capture() waiting on this stream
+        tap_cv_.notify_all();
+    }
     if (thread_.joinable())
         thread_.join();
     {
@@ -486,6 +490,67 @@ bool IQStreamer::waitRetuneSettled(std::chrono::milliseconds timeout) const
         std::this_thread::sleep_for(std::chrono::microseconds(200));
     }
     return true;
+}
+
+// ── Live-stream capture (snapshots without a channel of their own) ──────────
+
+bool IQStreamer::capture(int                       n,
+                         std::vector<float>&       out,
+                         double&                   cf_hz,
+                         double&                   sr_hz,
+                         std::chrono::milliseconds timeout)
+{
+    if (n <= 0 || !isRunning())
+        return false;
+    std::lock_guard one(capture_mu_);
+    out.assign((size_t)n * 2, 0.0f);
+    {
+        std::lock_guard lk(tap_mu_);
+        tap_      = {};
+        tap_.out  = &out;
+        tap_.need = n;
+        tap_.gen  = retune_gen_.load(std::memory_order_acquire);
+        tap_.cf   = currentCF();
+        tap_.sr   = currentSR();
+        tap_armed_.store(true, std::memory_order_release);
+    }
+    std::unique_lock lk(tap_mu_);
+    const bool       fin = tap_cv_.wait_for(lk,
+                                      timeout,
+                                      [this]
+                                      {
+                                          return tap_.done || !isRunning();
+                                      });
+    tap_armed_.store(false, std::memory_order_release);
+    const bool ok = fin && tap_.done && !tap_.failed;
+    cf_hz         = tap_.cf;
+    sr_hz         = tap_.sr;
+    tap_.out      = nullptr;
+    return ok;
+}
+
+void IQStreamer::feedTap(const float* samples, int n, uint32_t gen_at_read)
+{
+    std::lock_guard lk(tap_mu_);
+    if (!tap_.out || tap_.done)
+        return;
+    // A retune or rate change since the tap was armed: the samples no longer
+    // belong to the window the caller asked about.
+    if (gen_at_read != tap_.gen || currentCF() != tap_.cf || currentSR() != tap_.sr)
+    {
+        tap_.failed = tap_.done = true;
+        tap_cv_.notify_all();
+        return;
+    }
+    const int    take = std::min(n, tap_.need);
+    const size_t at   = tap_.out->size() / 2 - (size_t)tap_.need;
+    std::memcpy(tap_.out->data() + 2 * at, samples, (size_t)take * 2 * sizeof(float));
+    tap_.need -= take;
+    if (tap_.need == 0)
+    {
+        tap_.done = true;
+        tap_cv_.notify_all();
+    }
 }
 
 // ── Batched send ─────────────────────────────────────────────────────────────
@@ -741,6 +806,9 @@ void IQStreamer::workerLoop()
             pkt_flags |= IQ_FLAG_DWELL_CHANGE;
         if (n_send == 0 && pkt_flags == 0)
             continue;
+
+        if (tap_armed_.load(std::memory_order_acquire) && n_send > 0)
+            feedTap(ch_bufs[0].data() + off, n_send, gen_at_read);
 
         const uint64_t cf   = (uint64_t)std::llround(current_cf_.load(std::memory_order_relaxed));
         const uint32_t sr_u = current_sr_hz_.load(std::memory_order_relaxed);

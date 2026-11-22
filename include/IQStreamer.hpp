@@ -38,6 +38,7 @@ ResourceManager::activateTask() for all IQ delivery.
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -130,6 +131,17 @@ public:
     {
         return (double)current_sr_hz_.load(std::memory_order_relaxed);
     }
+
+    /// One-shot capture of @p n samples of the primary channel from the live
+    /// stream (the same settled samples the destinations get), for snapshots
+    /// served without a channel of their own. Fails — returns false — if the
+    /// stream stops, is retuned (LO or rate change) during the capture, or
+    /// @p timeout passes. @p cf_hz / @p sr_hz receive the window it ran at.
+    bool capture(int                       n,
+                 std::vector<float>&       out,
+                 double&                   cf_hz,
+                 double&                   sr_hz,
+                 std::chrono::milliseconds timeout);
 
     // Drain `settle_reads` readStream() calls without sending UDP packets.
     // Call *before* the retune: the read in flight and whatever the driver
@@ -242,6 +254,23 @@ private:
     std::vector<std::vector<float>> prefix_;
     std::atomic<uint32_t>           current_sr_hz_{0};
     std::thread                     thread_;
+
+    // capture() taps (one at a time; tap_mu_ serialises callers).
+    struct Tap
+    {
+        std::vector<float>* out    = nullptr;
+        int                 need   = 0;  // samples still wanted
+        uint32_t            gen    = 0;  // retune_gen_ when armed
+        double              cf     = 0.0, sr = 0.0;
+        bool                done   = false;
+        bool                failed = false;
+    };
+    std::mutex              capture_mu_;  // one capture() at a time
+    std::mutex              tap_mu_;
+    std::condition_variable tap_cv_;
+    Tap                     tap_;
+    std::atomic<bool>       tap_armed_{false};
+    void                    feedTap(const float* samples, int n, uint32_t gen_at_read);
     Clock::time_point               start_epoch_{};  // used when a consumer has no epoch
 
     // Both dests_ and subbands_ are protected by dests_mu_.
