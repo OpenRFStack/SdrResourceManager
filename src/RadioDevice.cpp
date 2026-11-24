@@ -202,7 +202,7 @@ bool RadioDevice::tune(double cf_hz, double sr_sps)
         const double target_rate =
             (cfg_.fixed_sample_rate_hz > 0.0) ? cfg_.fixed_sample_rate_hz : sr_sps;
 
-        if (std::abs(target_rate - current_rate_) > 1.0)
+        if (std::abs(target_rate - current_rate_.load()) > 1.0)
         {
             dev_->setSampleRate(SOAPY_SDR_RX, 0, target_rate);
             // The TX rate follows (rare: rate changes only). AD9361-class
@@ -222,7 +222,7 @@ bool RadioDevice::tune(double cf_hz, double sr_sps)
         current_cf_ = cf_hz;
         // debug: a scan logs this once per entry (hundreds per second).
         spdlog::debug(
-            "[{}] Tuned {:.3f} MHz {:.3f} MSPS", cfg_.id, cf_hz / 1e6, current_rate_ / 1e6);
+            "[{}] Tuned {:.3f} MHz {:.3f} MSPS", cfg_.id, cf_hz / 1e6, current_rate_.load() / 1e6);
         return true;
     }
     catch (const std::exception& ex)
@@ -501,14 +501,12 @@ std::vector<RadioDevice::TempSensor> RadioDevice::listTemperatures() const
 
 double RadioDevice::currentCF() const
 {
-    std::lock_guard l(mu_);
-    return current_cf_;
+    return current_cf_.load();
 }
 
 double RadioDevice::currentRate() const
 {
-    std::lock_guard l(mu_);
-    return current_rate_;
+    return current_rate_.load();
 }
 
 RadioDevice::Status RadioDevice::getStatus() const
@@ -519,12 +517,9 @@ RadioDevice::Status RadioDevice::getStatus() const
     s.uri             = cfg_.uri;
     s.coherency_group = cfg_.coherency_group;
     s.online          = online_.load(std::memory_order_acquire);
-    {
-        std::lock_guard l(mu_);
-        s.center_freq_hz = current_cf_;
-        s.sample_rate    = current_rate_;
-    }
-    s.temperature_c = cachedTemperature();  // was a live readSensor() (RM-17)
+    s.center_freq_hz  = current_cf_.load();
+    s.sample_rate     = current_rate_.load();
+    s.temperature_c   = cachedTemperature();  // was a live readSensor() (RM-17)
     return s;
 }
 

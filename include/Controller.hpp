@@ -35,8 +35,12 @@ Contact author for permission: https://github.com/OpenRFStack
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <thread>
+#include <utility>
 
 namespace sdr
 {
@@ -78,6 +82,17 @@ private:
     std::thread       scheduler_thread_;  ///< Calls rm_->schedulerTick() periodically.
     std::thread       watchdog_thread_;   ///< Calls rm_->watchdogTick() periodically.
     std::thread       heartbeat_thread_;  ///< Publishes TASK_STATUS heartbeats.
+
+    /// Task requests are admitted on this thread, in arrival order. Admission
+    /// can block on hardware (preemption teardown, combined-window retune,
+    /// waiting for a teardown in flight): on an RTL-SDR that held the AMQP
+    /// thread up to ~0.9 s, delaying every HEALTH_QUERY / STOP behind it.
+    std::thread                                     admission_thread_;
+    std::mutex                                      admission_mu_;
+    std::condition_variable                         admission_cv_;
+    std::deque<std::pair<TaskRequest, std::string>> admission_q_;
+    static constexpr size_t                         kMaxAdmissionQueue = 4096;
+    void                                            admissionLoop();
 
     std::mutex snapshot_mu_;
 

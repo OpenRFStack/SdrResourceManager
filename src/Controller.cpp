@@ -66,6 +66,7 @@ void Controller::run()
     scheduler_thread_ = std::thread(&Controller::schedulerLoop, this);
     watchdog_thread_  = std::thread(&Controller::watchdogLoop, this);
     heartbeat_thread_ = std::thread(&Controller::heartbeatLoop, this);
+    admission_thread_ = std::thread(&Controller::admissionLoop, this);
 
     spdlog::info("Controller: running");
     while (running_.load())
@@ -81,6 +82,12 @@ void Controller::stop()
     // Stop AMQP before joining background threads so no new snapshot threads
     // can be spawned via handleSnapshotRequest() while we're cleaning up.
     amqp_->stop();
+    {
+        std::lock_guard lk(admission_mu_);  // wake the admission thread
+        admission_cv_.notify_all();
+    }
+    if (admission_thread_.joinable())
+        admission_thread_.join();
     if (scheduler_thread_.joinable())
         scheduler_thread_.join();
     if (watchdog_thread_.joinable())
@@ -157,8 +164,42 @@ void Controller::handleTaskRequest(const TaskRequest& req, const std::string& re
                    reply_to);
         return;
     }
-    auto resp = rm_->tryAccept(req);
-    amqp_->sendResponse(MessageCodec::encodeTaskResponse(resp), reply_to);
+    {
+        std::lock_guard lk(admission_mu_);
+        if (admission_q_.size() < kMaxAdmissionQueue)
+        {
+            admission_q_.emplace_back(req, reply_to);
+            admission_cv_.notify_one();
+            return;
+        }
+    }
+    sendReject(req.request_id,
+               req.correlation_id,
+               RejectCode::INTERNAL_ERROR,
+               "Admission queue full",
+               reply_to);
+}
+
+void Controller::admissionLoop()
+{
+    for (;;)
+    {
+        std::pair<TaskRequest, std::string> item;
+        {
+            std::unique_lock lk(admission_mu_);
+            admission_cv_.wait(lk,
+                               [this]
+                               {
+                                   return !admission_q_.empty() || !running_.load();
+                               });
+            if (!running_.load())
+                return;  // shutting down: queued requests are dropped
+            item = std::move(admission_q_.front());
+            admission_q_.pop_front();
+        }
+        auto resp = rm_->tryAccept(item.first);
+        amqp_->sendResponse(MessageCodec::encodeTaskResponse(resp), item.second);
+    }
 }
 
 void Controller::handleTaskStop(const TaskRequest& req, const std::string& reply_to)

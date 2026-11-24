@@ -220,8 +220,11 @@ private:
     SoapySDR::Device*  dev_ = nullptr;
     std::atomic<bool>  online_{false};
     mutable std::mutex mu_;
-    double             current_cf_   = 0.0;
-    double             current_rate_ = 0.0;
+    // Written under mu_ by tune(); read lock-free: mu_ is held for whole
+    // hardware calls (tune / stream open / close: 50-500 ms on an RTL-SDR),
+    // and a HEALTH_QUERY reading these waited behind them (RM-99).
+    std::atomic<double> current_cf_{0.0};
+    std::atomic<double> current_rate_{0.0};
     /// Rate last programmed per RX channel by tuneChannel() (shared_lo=false):
     /// re-setting an unchanged rate on every scan hop reconfigured the ADC
     /// path on many drivers (RM-73). Cleared by close().
