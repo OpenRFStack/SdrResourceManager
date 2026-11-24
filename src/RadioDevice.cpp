@@ -17,7 +17,9 @@ Contact author for permission: https://github.com/OpenRFStack
 #include <SoapySDR/Types.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <cmath>
+#include <thread>
 #include <limits>
 #include <stdexcept>
 
@@ -168,6 +170,8 @@ void RadioDevice::close()
     current_rate_ = 0.0;
     ch_rate_.clear();
     open_streams_ = 0;
+    stream_channels_.clear();
+    activated_at_.clear();
     if (!claimed_key_.empty())
     {
         std::lock_guard<std::mutex> claim_lock(claimMutex());
@@ -314,6 +318,17 @@ SoapySDR::Stream* RadioDevice::openRxStream(const std::vector<int>& channels)
         std::lock_guard lock(mu_);
         if (!online_ || !dev_)
             return nullptr;
+        for (const auto& [st, chs] : stream_channels_)
+            for (int c : chs)
+                if (std::find(channels.begin(), channels.end(), c) != channels.end())
+                {
+                    spdlog::error("[{}] openRxStream: channel {} already has an open stream — "
+                                  "refused (a second stream on one channel corrupts the "
+                                  "driver)",
+                                  cfg_.id,
+                                  c);
+                    return nullptr;
+                }
         try
         {
             std::vector<size_t> chans;
@@ -322,7 +337,10 @@ SoapySDR::Stream* RadioDevice::openRxStream(const std::vector<int>& channels)
             SoapySDR::Stream* s          = dev_->setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32, chans);
             consecutive_stream_failures_ = 0;
             if (s)
+            {
                 ++open_streams_;
+                stream_channels_[s] = channels;
+            }
             return s;
         }
         catch (const std::exception& ex)
@@ -370,7 +388,10 @@ bool RadioDevice::activateStream(SoapySDR::Stream* s)
         return false;
     try
     {
-        return dev_->activateStream(s) == 0;
+        const bool ok = dev_->activateStream(s) == 0;
+        if (ok)
+            activated_at_[s] = std::chrono::steady_clock::now();
+        return ok;
     }
     catch (...)
     {
@@ -380,7 +401,21 @@ bool RadioDevice::activateStream(SoapySDR::Stream* s)
 
 void RadioDevice::deactivateStream(SoapySDR::Stream* s)
 {
+    // librtlsdr ignores a cancel issued before its reader thread is running
+    // and SoapyRTLSDR then joins that thread forever: a task torn down right
+    // after activation hung the RM (RTL2838: deactivate 0 us after activate
+    // hangs; >= 1 ms or after the first read: 0 of 200). Give every stream
+    // kMinActiveMs before deactivating it.
+    std::chrono::steady_clock::time_point since{};
+    {
+        std::lock_guard lock(mu_);
+        if (auto it = activated_at_.find(s); it != activated_at_.end())
+            since = it->second;
+    }
+    if (since != std::chrono::steady_clock::time_point{})
+        std::this_thread::sleep_until(since + std::chrono::milliseconds(kMinActiveMs));
     std::lock_guard lock(mu_);
+    activated_at_.erase(s);
     if (!s || !dev_)
         return;
     try
@@ -395,6 +430,8 @@ void RadioDevice::deactivateStream(SoapySDR::Stream* s)
 void RadioDevice::closeStream(SoapySDR::Stream* s)
 {
     std::lock_guard lock(mu_);
+    activated_at_.erase(s);
+    stream_channels_.erase(s);
     if (!s || !dev_)
         return;
     try

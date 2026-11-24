@@ -31,6 +31,8 @@ Contact author for permission: https://github.com/OpenRFStack
 #include <SoapySDR/Device.hpp>
 
 #include <atomic>
+#include <unordered_map>
+#include <chrono>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -239,6 +241,14 @@ private:
     /// IQStreamer / TriggerMonitor on this device holds a raw pointer to — it
     /// must never happen while one is open (RM-69).
     int open_streams_ = 0;
+    /// activateStream() time per stream (mu_): deactivateStream() waits
+    /// until a stream has been active kMinActiveMs (RM-100).
+    std::unordered_map<SoapySDR::Stream*, std::chrono::steady_clock::time_point> activated_at_;
+    static constexpr int kMinActiveMs = 50;
+    /// Channels of each open stream (mu_). A channel is in at most one open
+    /// stream: a second setupStream() on a busy channel crashed SoapyRTLSDR
+    /// (one buffer set per device) under its first reader (RM-101).
+    std::unordered_map<SoapySDR::Stream*, std::vector<int>> stream_channels_;
 
     // Identifier (uri/hostname/serial/label) claimed via Device::enumerate()
     // when devices.xml leaves <uri> empty, so a second RadioDevice instance

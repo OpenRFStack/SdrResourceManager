@@ -157,8 +157,13 @@ public:
         return 0;
     }
 
-    int deactivateStream(SoapySDR::Stream*, const int, const long long) override
+    int deactivateStream(SoapySDR::Stream* s, const int, const long long) override
     {
+        if (std::chrono::steady_clock::now() - reinterpret_cast<StreamState*>(s)->t_activate
+            < std::chrono::milliseconds(1))
+            FakeSoapy::early_deactivations.fetch_add(1);
+        if (int d = FakeSoapy::deactivate_delay_us.load(); d > 0)
+            std::this_thread::sleep_for(std::chrono::microseconds(d));
         return 0;
     }
 

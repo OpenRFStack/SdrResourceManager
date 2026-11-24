@@ -48,6 +48,8 @@ Contact author for permission: https://github.com/OpenRFStack
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <unordered_set>
+#include <thread>
 #include <optional>
 #include <set>
 #include <string>
@@ -238,6 +240,14 @@ private:
         bool                                                    is_subband_consumer = false;
         IQStreamer::Clock::time_point                           epoch{};  ///< task time base
     };
+
+    /// Tasks whose activateTask() is running, and on which thread (reg_mu_).
+    std::unordered_map<std::string, std::thread::id> activating_;
+    /// Tasks ended mid-activation whose slots/ports the activation releases (reg_mu_).
+    std::unordered_set<std::string> release_pending_;
+    std::condition_variable         activation_cv_;  ///< an activateTask() exited (reg_mu_)
+    /// Free a task's timeline slots and pool ports.
+    void releaseReservations(const std::string& task_id);
 
     mutable std::mutex                           rt_mu_;
     std::unordered_map<std::string, TaskRuntime> runtimes_;

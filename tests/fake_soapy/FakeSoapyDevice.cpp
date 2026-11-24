@@ -36,6 +36,8 @@ std::atomic<double> tone_hz{0.0};
 std::atomic<float>  tone_amplitude{0.5f};
 std::atomic<bool>   hw_time{false};
 std::atomic<double> hw_time_scale{1.0};
+std::atomic<int>    early_deactivations{0};
+std::atomic<int>    deactivate_delay_us{0};
 std::atomic<int>    activate_delay_us{0};
 std::atomic<int>    activate_delay_calls{0};
 std::atomic<bool>   activate_delay_limited{false};
@@ -85,6 +87,8 @@ void reset()
     tone_amplitude.store(0.5f);
     hw_time.store(false);
     hw_time_scale.store(1.0);
+    early_deactivations.store(0);
+    deactivate_delay_us.store(0);
     activate_delay_us.store(0);
     activate_delay_calls.store(0);
     activate_delay_limited.store(false);

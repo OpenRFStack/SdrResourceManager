@@ -1325,8 +1325,12 @@ TaskResponse ResourceManager::doAcceptSnapshot(const TaskRequest& req, SnapshotR
             dev        = candidate->device;
             snap_ch    = candidate->fit.avail_rx[0];
             auto alloc = makeAllocation(*dev, candidate->fit, sp.sample_rate_sps, {});
-            timelines_[dev->id()]->insert(
-                makeSlot(slot_id, now, now + budget_ms, alloc, candidate->fit, false));
+            // Exclusive on a shared LO: the capture runs on a stream of its
+            // own, which nobody can subscribe to — the combined-window path
+            // used to count its channel as live and a second stream was
+            // opened on it (crashed SoapyRTLSDR, RM-101).
+            timelines_[dev->id()]->insert(makeSlot(
+                slot_id, now, now + budget_ms, alloc, candidate->fit, dev->config().shared_lo));
         }
     }
     if (no_channel)
@@ -1915,6 +1919,19 @@ void ResourceManager::applyPreemption(const PreemptPlan& plan,
                      request_id);
         deactivateTask(tid, TaskState::CANCELLED, reason);
     }
+    // A victim still activating keeps its channels until that activation
+    // exits (RM-102): wait (bounded) so the re-validation sees them free —
+    // otherwise the request was rejected after its victims were cancelled.
+    std::unique_lock lk(reg_mu_);
+    activation_cv_.wait_for(lk,
+                            std::chrono::seconds(2),
+                            [&]
+                            {
+                                for (const auto& v : plan.victims)
+                                    if (activating_.count(v))
+                                        return false;
+                                return true;
+                            });
 }
 
 std::optional<std::vector<std::string>>
@@ -2348,6 +2365,30 @@ TaskResponse ResourceManager::cancelTask(const std::string& task_id,
 // ── Activate a task (move SCHEDULED/PENDING → RUNNING) ───────────────────
 void ResourceManager::activateTask(const std::string& task_id)
 {
+    {
+        std::lock_guard lock(reg_mu_);
+        activating_[task_id] = std::this_thread::get_id();
+    }
+    // On every exit: release the reservations a teardown deferred to us
+    // (RM-102) — by then any stream this activation opened is closed.
+    struct ActivationExit
+    {
+        ResourceManager*   rm;
+        const std::string& id;
+
+        ~ActivationExit()
+        {
+            bool pending = false;
+            {
+                std::lock_guard lock(rm->reg_mu_);
+                rm->activating_.erase(id);
+                pending = rm->release_pending_.erase(id) > 0;
+            }
+            if (pending)
+                rm->releaseReservations(id);
+            rm->activation_cv_.notify_all();
+        }
+    } activation_exit{this, task_id};
     TaskRecord  rec;
     GainRequest gains;
     {
@@ -2970,6 +3011,7 @@ void ResourceManager::teardownTask(const std::string&       task_id,
         trig_mon_to_stop->stop();
     // Destroyed after the locks are released (an IQStreamer joins its worker).
     std::vector<std::shared_ptr<IQStreamer>> keep_alive;
+    bool                                     had_runtime = false;
     {
         if (hw_ids.empty())
         {  // no allocations on record: the radios the runtime actually uses
@@ -2982,74 +3024,78 @@ void ResourceManager::teardownTask(const std::string&       task_id,
         // The task's hardware locks before rt_mu_ (matching activateTask's
         // lock ordering) — deactivateStream/closeStream below must be
         // serialized against concurrent hardware setup on those radios.
-        auto            hwlock = lockHw(hw_ids);
-        std::lock_guard lock(rt_mu_);
-        auto            it = runtimes_.find(task_id);
-        if (it != runtimes_.end())
+        auto hwlock = lockHw(hw_ids);
+        // Under rt_mu_ only bookkeeping: what to stop and close. The driver
+        // calls (stopping a streamer joins its reader; deactivate / close
+        // can block, or hang — SoapyRTLSDR did, RM-100) run after rt_mu_ is
+        // released, under this task's hardware locks only. They used to run
+        // under rt_mu_, so one stuck radio froze admission, snapshots and
+        // status for every radio.
+        std::vector<std::shared_ptr<IQStreamer>>                to_stop;
+        std::vector<std::pair<RadioDevice*, SoapySDR::Stream*>> to_close;
         {
-            auto& rt = it->second;
-            // An executor attached after we looked above (orphaned runtime
-            // race) is still stopped below, after the streams are gone.
-            if (rt.scan_exec)
-                scan_exec_to_stop = std::move(rt.scan_exec);
-            if (rt.trig_mon)
-                trig_mon_to_stop = std::move(rt.trig_mon);
-
-            // Remove this task's subscription from each streamer.
-            // Sub-band consumers registered via addSubBand; raw fan-out via addDest.
-            // A task can hold raw dests and DDC sub-bands (multi-device); both
-            // removals are no-ops when absent.
-            for (auto& streamer : rt.streamers)
+            std::lock_guard lock(rt_mu_);
+            auto            it = runtimes_.find(task_id);
+            had_runtime     = it != runtimes_.end();
+            if (it != runtimes_.end())
             {
-                streamer->removeSubBand(task_id);
-                streamer->removeDest(task_id);
-            }
+                auto& rt = it->second;
+                // An executor attached after we looked above (orphaned runtime
+                // race) is still stopped below, after the streams are gone.
+                if (rt.scan_exec)
+                    scan_exec_to_stop = std::move(rt.scan_exec);
+                if (rt.trig_mon)
+                    trig_mon_to_stop = std::move(rt.trig_mon);
 
-            // Close the SoapySDR stream only when the last consumer (dest or sub-band) is gone.
-            // Shared-LO streams are tracked in channel_states_ — close when no consumers remain.
-            // Independent-LO streams are NOT in channel_states_ (each task owns its stream
-            // exclusively) — always close them directly to avoid leaking the SoapySDR stream.
-            for (auto& [d, s] : rt.soapy_streams)
-            {
-                bool should_close            = false;
-                bool found_in_channel_states = false;
-                for (auto cs = channel_states_.begin(); cs != channel_states_.end();)
+                // Remove this task's subscription from each streamer (raw
+                // fan-out and DDC sub-bands; both no-ops when absent).
+                for (auto& streamer : rt.streamers)
                 {
-                    if (cs->second.soapy_stream == s)
+                    streamer->removeSubBand(task_id);
+                    streamer->removeDest(task_id);
+                }
+
+                // Shared-LO streams (channel_states_) close when their last
+                // consumer is gone; independent-LO streams belong to this task
+                // alone and always close.
+                for (auto& [d, s] : rt.soapy_streams)
+                {
+                    bool should_close            = false;
+                    bool found_in_channel_states = false;
+                    for (auto cs = channel_states_.begin(); cs != channel_states_.end();)
                     {
-                        found_in_channel_states = true;
-                        if (cs->second.streamer->totalConsumers() == 0)
+                        if (cs->second.soapy_stream == s)
                         {
-                            cs->second.streamer->stop();
-                            should_close = true;
-                            cs           = channel_states_.erase(cs);
+                            found_in_channel_states = true;
+                            if (cs->second.streamer->totalConsumers() == 0)
+                            {
+                                to_stop.push_back(cs->second.streamer);
+                                should_close = true;
+                                cs           = channel_states_.erase(cs);
+                                continue;
+                            }
                         }
-                        else
-                        {
-                            ++cs;
-                        }
-                    }
-                    else
-                    {
                         ++cs;
                     }
+                    if (!found_in_channel_states)
+                    {
+                        for (auto& streamer : rt.streamers)
+                            to_stop.push_back(streamer);
+                        should_close = true;
+                    }
+                    if (should_close && d && s)
+                        to_close.push_back({d, s});
                 }
-                if (!found_in_channel_states)
-                {
-                    // Independent-LO stream exclusively owned by this task — stop all
-                    // its IQStreamers (idempotent) and close the stream unconditionally.
-                    for (auto& streamer : rt.streamers)
-                        streamer->stop();
-                    should_close = true;
-                }
-                if (should_close && d && s)
-                {
-                    d->deactivateStream(s);
-                    d->closeStream(s);
-                }
+                keep_alive = std::move(rt.streamers);
+                runtimes_.erase(it);
             }
-            keep_alive = std::move(rt.streamers);
-            runtimes_.erase(it);
+        }
+        for (auto& st : to_stop)  // before the streams they read are closed
+            st->stop();
+        for (auto& [d, s] : to_close)
+        {
+            d->deactivateStream(s);
+            d->closeStream(s);
         }
     }
     if (scan_exec_to_stop)
@@ -3064,25 +3110,46 @@ void ResourceManager::teardownTask(const std::string&       task_id,
     // the ports. Releasing again would corrupt the pool.
     if (!already_terminal)
     {
-        std::lock_guard lock(reg_mu_);
-        auto            it = registry_.find(task_id);
-        if (it != registry_.end())
+        // Ended while its activation is still setting up the hardware on
+        // another thread (no runtime yet): the channels are not free until
+        // that activation's stream is closed. Freeing them here let the next
+        // task open a second stream on the same channel beside it (RM-102);
+        // the activation releases them when it exits.
+        bool defer = false;
         {
-            for (auto& alloc : it->second.allocations)
+            std::lock_guard lock(reg_mu_);
+            auto            a = activating_.find(task_id);
+            if (!had_runtime && a != activating_.end()
+                && a->second != std::this_thread::get_id())
             {
-                if (timelines_.count(alloc.device_id))
-                    timelines_[alloc.device_id]->remove(task_id);
-                // Only the pool's own ports: a client port equal to a pool
-                // port held by another live task freed that task's (RM-88).
-                port_pool_->releaseAll(alloc.pool_ports);
+                release_pending_.insert(task_id);
+                defer = true;
             }
         }
+        if (!defer)
+            releaseReservations(task_id);
     }
     // A second teardown of an already-terminal task (orphaned runtime, or the
     // trigger/scan done-callback racing a stop) changes no state: publishing
     // again sent clients the terminal status twice.
     if (!already_terminal)
         notifyStateChange(task_id);
+}
+
+void ResourceManager::releaseReservations(const std::string& task_id)
+{
+    std::lock_guard lock(reg_mu_);
+    auto            it = registry_.find(task_id);
+    if (it == registry_.end())
+        return;
+    for (auto& alloc : it->second.allocations)
+    {
+        if (timelines_.count(alloc.device_id))
+            timelines_[alloc.device_id]->remove(task_id);
+        // Only the pool's own ports: a client port equal to a pool
+        // port held by another live task freed that task's (RM-88).
+        port_pool_->releaseAll(alloc.pool_ports);
+    }
 }
 
 // ── Scheduler / Watchdog ticks ───────────────────────────────────────────

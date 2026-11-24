@@ -1986,6 +1986,19 @@ TEST(AuditRegression, RM85_OfflineRadioRetryDoesNotBlockTheWatchdog)
 // port held by another live task (a fixed receiver port inside the pool range,
 // on another host) freed that task's port, and the next task was given it too:
 // two streams to one UDP port.
+// Tasks are stopped only once RUNNING: a task stopped while still activating
+// keeps its reservations until its activation exits (RM-102), so the exact
+// port counts below would race with it.
+static bool waitRunning(const ResourceManager& rm, int n)
+{
+    return waitUntil(
+        [&]
+        {
+            return rm.countByState(TaskState::RUNNING) == n;
+        },
+        2000);
+}
+
 TEST(AuditRegression, RM88_ClientPortIsNotReleasedIntoThePool)
 {
     FakeSoapy::reset();
@@ -1999,6 +2012,7 @@ TEST(AuditRegression, RM88_ClientPortIsNotReleasedIntoThePool)
 
     auto a = rm.tryAccept(continuousReq("a", 916e6, 200e3, 250e3, 1, {b_port}));  // client port
     ASSERT_TRUE(a.accepted);
+    ASSERT_TRUE(waitRunning(rm, 2));
     ASSERT_TRUE(rm.stopTask(a.task_id, "a-stop", "done").accepted);
     std::printf("RM-88: pool ports in use after stopping the client-port task: %d (B still "
                 "running)\n",
@@ -2009,6 +2023,7 @@ TEST(AuditRegression, RM88_ClientPortIsNotReleasedIntoThePool)
     ASSERT_TRUE(c.accepted);
     ASSERT_EQ(c.streams.size(), 1u);
     EXPECT_NE(c.streams[0].udp_port, b_port) << "two live tasks stream to the same port";
+    ASSERT_TRUE(waitRunning(rm, 2));
     rm.stopTask(b.task_id, "b-stop", "done");
     rm.stopTask(c.task_id, "c-stop", "done");
     EXPECT_EQ(rm.udpPortsUsed(), 0);
@@ -2027,6 +2042,7 @@ TEST(AuditRegression, RM89_PoolPortDoesNotDuplicateTheClientsOwnPort)
     ASSERT_EQ(r.streams.size(), 2u);
     std::printf("RM-89: channel ports %d, %d\n", r.streams[0].udp_port, r.streams[1].udp_port);
     EXPECT_NE(r.streams[0].udp_port, r.streams[1].udp_port);
+    ASSERT_TRUE(waitRunning(rm, 1));
     rm.stopTask(r.task_id, "stop", "done");
     EXPECT_EQ(rm.udpPortsUsed(), 0);
 }
@@ -2217,13 +2233,13 @@ TEST(AuditRegression, RM93_RankInvariantsUnderRandomMultiDeviceLoad)
             }
             else if (kind == 1 && (k % 3) == 0)  // calibration over one group (RM-95)
             {
-                const int rk                     = r.rank;
-                r                                = (k % 2) ? calibrationReq({"fake-0", "fake-1"})
-                                                           : calibrationReq({"fake-2", "fake-3"});
-                r.cal_params->coherency_group    = (k % 2) ? "grp" : "grp2";
+                const int rk                      = r.rank;
+                r                                 = (k % 2) ? calibrationReq({"fake-0", "fake-1"})
+                                                            : calibrationReq({"fake-2", "fake-3"});
+                r.cal_params->coherency_group     = (k % 2) ? "grp" : "grp2";
                 r.cal_params->rx_count_per_device = 1;
-                r.cal_params->center_freq_hz     = cfs[band(g)];
-                r.rank                           = rk;
+                r.cal_params->center_freq_hz      = cfs[band(g)];
+                r.rank                            = rk;
             }
             std::set<std::string> before;
             for (auto& t : rm.getActiveTasks())
@@ -2289,8 +2305,8 @@ TEST(AuditRegression, RM94_SnapshotServedFromALiveStreamWhenNoChannelIsFree)
         r.request_id = "snap";
         r.task_type  = TaskType::SNAPSHOT;
         SnapshotParams sp;
-        sp.center_freq_hz = cf;
-        sp.bandwidth_hz   = 200e3;
+        sp.center_freq_hz  = cf;
+        sp.bandwidth_hz    = 200e3;
         sp.sample_rate_sps = 250e3;
         sp.fft_size        = 1024;
         sp.n_averages      = 4;
@@ -2306,8 +2322,8 @@ TEST(AuditRegression, RM94_SnapshotServedFromALiveStreamWhenNoChannelIsFree)
     ASSERT_TRUE(resp.accepted);
     ASSERT_TRUE(res.success);
     ASSERT_EQ(res.power_bins.size(), 1024u);
-    const auto pk = std::max_element(res.power_bins.begin(), res.power_bins.end())
-                    - res.power_bins.begin();
+    const auto pk =
+        std::max_element(res.power_bins.begin(), res.power_bins.end()) - res.power_bins.begin();
     const double f_pk = res.freq_axis_start_hz + pk * res.freq_axis_step_hz;
     std::printf("RM-94: peak at %.4f MHz (tone 915.3000), %.1f dB, rate %.0f S/s\n",
                 f_pk / 1e6,
@@ -2377,19 +2393,19 @@ TEST(AuditRegression, RM96_NoTaskSubscribesToATriggeredTasksStream)
     ResourceManager rm(cfgA(2, 47'340, 47'359), noopState, noopErr);
     ASSERT_EQ(rm.openDevices(), 2);
     TaskRequest t;
-    t.msg_type               = "TASK_REQUEST_TRIGGERED";
-    t.task_type              = TaskType::TRIGGERED;
-    t.request_id             = "trig";
-    t.schema_version         = "2.0";
-    t.schedule_mode          = ScheduleMode::CONTINUOUS;
-    t.start_time_ms          = epochMs();
-    t.end_time_ms            = TIME_INFINITE;
-    t.rf.center_freq_hz      = 915e6;
-    t.rf.bandwidth_hz        = 200e3;
-    t.rf.sample_rate_sps     = 2e6;
-    t.rf.rx_count            = 1;
-    t.rf.required_device     = "fake-0";
-    t.streaming.dest_ip      = "127.0.0.1";
+    t.msg_type           = "TASK_REQUEST_TRIGGERED";
+    t.task_type          = TaskType::TRIGGERED;
+    t.request_id         = "trig";
+    t.schema_version     = "2.0";
+    t.schedule_mode      = ScheduleMode::CONTINUOUS;
+    t.start_time_ms      = epochMs();
+    t.end_time_ms        = TIME_INFINITE;
+    t.rf.center_freq_hz  = 915e6;
+    t.rf.bandwidth_hz    = 200e3;
+    t.rf.sample_rate_sps = 2e6;
+    t.rf.rx_count        = 1;
+    t.rf.required_device = "fake-0";
+    t.streaming.dest_ip  = "127.0.0.1";
     TriggerParams tp;
     tp.threshold_dbfs = -10.0;
     t.trigger_params  = tp;
@@ -2402,12 +2418,12 @@ TEST(AuditRegression, RM96_NoTaskSubscribesToATriggeredTasksStream)
         2000));
 
     UdpRx rx;
-    auto  req            = continuousReq("c", 915.5e6, 200e3, 250e3, 1, {rx.port});
-    req.rf.required_device = "fake-0";  // the armed trigger's radio, same CF
-    auto c               = rm.tryAccept(req);
+    auto  req                          = continuousReq("c", 915.5e6, 200e3, 250e3, 1, {rx.port});
+    req.rf.required_device             = "fake-0";  // the armed trigger's radio, same CF
+    auto                             c = rm.tryAccept(req);
     IqPacketHeader                   h{};
     std::vector<std::complex<float>> iq;
-    const bool got = c.accepted && rx.recv(h, iq, 1500);
+    const bool                       got = c.accepted && rx.recv(h, iq, 1500);
     std::printf("RM-96: continuous task on the armed trigger's radio: %s, IQ %s\n",
                 c.accepted ? "accepted" : ("rejected: " + c.reject_reason).c_str(),
                 got ? "received" : "none");
@@ -2444,12 +2460,136 @@ TEST(AuditRegression, RM97_InconsistentDriverTimestampsAreNotTrusted)
             worst = std::max(worst, std::abs((double)(h.timestamp_ns - ts0) - expect));
             samples += h.num_samples;
         }
-        std::printf("RM-97: driver time scale %.1f: worst timestamp error %.2f ms over %llu samples\n",
-                    scale,
-                    worst / 1e6,
-                    (unsigned long long)samples);
-        EXPECT_LT(worst, 1e6) << "packet timestamps do not follow the samples (scale " << scale << ")";
+        std::printf(
+            "RM-97: driver time scale %.1f: worst timestamp error %.2f ms over %llu samples\n",
+            scale,
+            worst / 1e6,
+            (unsigned long long)samples);
+        EXPECT_LT(worst, 1e6) << "packet timestamps do not follow the samples (scale " << scale
+                              << ")";
     }
+}
+
+// RM-100: SoapyRTLSDR joins its reader thread forever when a stream is
+// deactivated before librtlsdr has started reading (measured on an RTL2838:
+// deactivate right after activate hangs; >= 1 ms after: 0 of 200). Under
+// mixed load a task stopped right after activation hung the RM's teardown —
+// inside rt_mu_, so admission, snapshots and status froze for every radio.
+TEST(AuditRegression, RM100_NoDeactivationRightAfterActivation)
+{
+    FakeSoapy::reset();
+    auto        cfg = cfgA(1, 47'380, 47'399);
+    RadioDevice dev(cfg.devices[0]);
+    ASSERT_TRUE(dev.open());
+    for (int i = 0; i < 5; ++i)
+    {
+        auto* s = dev.openRxStream({0});
+        ASSERT_NE(s, nullptr);
+        ASSERT_TRUE(dev.activateStream(s));
+        dev.deactivateStream(s);  // back to back: the librtlsdr hang
+        dev.closeStream(s);
+    }
+    std::printf("RM-100: deactivations < 1 ms after activation: %d of 5\n",
+                FakeSoapy::early_deactivations.load());
+    EXPECT_EQ(FakeSoapy::early_deactivations.load(), 0);
+}
+
+TEST(AuditRegression, RM100_SlowDriverTeardownDoesNotBlockOtherRadios)
+{
+    FakeSoapy::reset();
+    ResourceManager rm(cfgA(2, 47'400, 47'419), noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 2);
+    auto a               = continuousReq("a", 915e6, 1e6, 1e6, 1);
+    a.rf.required_device = "fake-0";
+    auto ra              = rm.tryAccept(a);
+    ASSERT_TRUE(ra.accepted);
+    ASSERT_TRUE(waitUntil(
+        [&]
+        {
+            return rm.countByState(TaskState::RUNNING) == 1;
+        },
+        1000));
+    std::this_thread::sleep_for(milliseconds(60));
+    FakeSoapy::deactivate_delay_us.store(1'500'000);  // fake-0's driver: 1.5 s to deactivate
+    rm.stopTask(ra.task_id, "s", "slow driver", /*async=*/true);
+    std::this_thread::sleep_for(milliseconds(100));  // teardown is inside deactivateStream now
+
+    auto t0 = steady_clock::now();
+    (void)rm.deviceSummaries();
+    const auto health_ms = duration_cast<milliseconds>(steady_clock::now() - t0).count();
+    auto       b         = continuousReq("b", 433e6, 1e6, 1e6, 1);
+    b.rf.required_device = "fake-1";
+    t0                   = steady_clock::now();
+    auto       rb        = rm.tryAccept(b);
+    const bool running   = waitUntil(
+        [&]
+        {
+            for (auto& t : rm.getActiveTasks())
+                if (t.task_id == rb.task_id && t.state == TaskState::RUNNING)
+                    return true;
+            return false;
+        },
+        3000);
+    const auto other_ms = duration_cast<milliseconds>(steady_clock::now() - t0).count();
+    std::printf("RM-100: while fake-0 deactivates for 1.5 s: health %lld ms, task on fake-1 "
+                "RUNNING after %lld ms\n",
+                (long long)health_ms,
+                (long long)other_ms);
+    EXPECT_TRUE(rb.accepted && running);
+    EXPECT_LT(health_ms, 200);
+    EXPECT_LT(other_ms, 500);
+    FakeSoapy::deactivate_delay_us.store(0);
+}
+
+// RM-101: a snapshot captures on a stream of its own, but the combined-window
+// path counted its slot's channel as live and "subscribed" a new task to it;
+// activation found no shared stream and opened a second one on the same
+// channel. On an RTL-SDR (one buffer set per device) that crashed the driver
+// (TSan SEGV in SoapyRTLSDR::readStream, 10 req/s mixed load).
+TEST(AuditRegression, RM101_NoSecondStreamBesideASnapshot)
+{
+    FakeSoapy::reset();
+    FakeSoapy::read_delay_us.store(2000);  // 256 samples / 2 ms: the capture takes ~0.5 s
+    auto cfg                        = cfgA(1, 47'420, 47'439);
+    cfg.devices[0].caps.rx_channels = 1;
+    ResourceManager rm(cfg, noopState, noopErr);
+    ASSERT_EQ(rm.openDevices(), 1);
+
+    std::atomic<int>  max_open{0};
+    std::atomic<bool> polling{true};
+    std::thread       poll(
+        [&]
+        {
+            while (polling)
+            {
+                max_open = std::max(max_open.load(), FakeSoapy::open_streams.load());
+                std::this_thread::sleep_for(milliseconds(1));
+            }
+        });
+    TaskRequest snap;
+    snap.msg_type        = "TASK_REQUEST_SNAPSHOT";
+    snap.request_id      = "snap";
+    snap.task_type       = TaskType::SNAPSHOT;
+    snap.snapshot_params = SnapshotParams{915e6, 1e6, 1e6, 1024, 64, ""};
+    auto fut             = std::async(std::launch::async,
+                          [&]
+                          {
+                              return rm.tryAccept(snap).accepted;
+                          });
+    std::this_thread::sleep_for(milliseconds(100));  // the snapshot is capturing
+    auto       c       = rm.tryAccept(continuousReq("c", 915.2e6, 100e3, 250e3, 1));
+    const bool snap_ok = fut.get();
+    std::this_thread::sleep_for(milliseconds(300));
+    polling = false;
+    poll.join();
+    std::printf("RM-101: snapshot %s; task beside it %s; max open streams %d\n",
+                snap_ok ? "ok" : "failed",
+                c.accepted ? "accepted" : ("rejected (" + c.reject_reason + ")").c_str(),
+                max_open.load());
+    EXPECT_TRUE(snap_ok);
+    EXPECT_LE(max_open.load(), 1) << "two streams on the one channel";
+    EXPECT_EQ(rm.countByState(TaskState::FAILED), 0)
+        << "accepted beside the snapshot, then its stream open was refused";
 }
 
 /*

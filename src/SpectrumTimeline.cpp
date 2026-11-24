@@ -151,7 +151,7 @@ FitResult SpectrumTimeline::canFit(int64_t           t_start,
         {
             res.reject_code = RejectCode::RETUNE_CONFLICT;
             res.reject_reason =
-                "Device LO is exclusively held (scan / armed trigger) by task " + s->task_id;
+                "Device LO is exclusively held (scan / armed trigger / snapshot) by task " + s->task_id;
             return res;
         }
     }
@@ -346,7 +346,7 @@ SpectrumTimeline::CombineResult SpectrumTimeline::canCombine(int64_t t_start,
         if (s->exclusive)
         {
             res.reject_reason =
-                "Device LO is exclusively held (scan / armed trigger) by task " + s->task_id;
+                "Device LO is exclusively held (scan / armed trigger / snapshot) by task " + s->task_id;
             return res;
         }
     }
