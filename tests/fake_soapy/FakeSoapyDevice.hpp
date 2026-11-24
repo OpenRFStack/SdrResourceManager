@@ -299,7 +299,8 @@ public:
         if (FakeSoapy::hw_time.load())
         {
             flags |= SOAPY_SDR_HAS_TIME;
-            timeNs = (long long)std::llround(st->samples_since_activate * 1e9 / fs);
+            timeNs = (long long)std::llround(st->samples_since_activate * 1e9 / fs
+                                             * FakeSoapy::hw_time_scale.load());
         }
         st->samples_since_activate += (long long)n;
         return static_cast<int>(n);

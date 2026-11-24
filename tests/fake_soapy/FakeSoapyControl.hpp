@@ -41,6 +41,9 @@ extern std::atomic<float>  tone_amplitude;
 // When true, readStream sets SOAPY_SDR_HAS_TIME and reports
 // timeNs = samples_since_activate · 1e9 / fs.
 extern std::atomic<bool> hw_time;
+// Scale applied to those timestamps: 2.0 models SoapyRTLSDR, whose tick
+// counter advances 2x the sample count (measured on an RTL2838, 2.048 MS/s).
+extern std::atomic<double> hw_time_scale;
 extern std::atomic<int>  activate_delay_us;       // µs sleep inside activateStream
 extern std::atomic<int>  activate_delay_calls;    // with activate_delay_limited: only the next N
 extern std::atomic<bool> activate_delay_limited;  //   activateStream calls sleep activate_delay_us

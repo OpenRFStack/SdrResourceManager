@@ -2415,6 +2415,43 @@ TEST(AuditRegression, RM96_NoTaskSubscribesToATriggeredTasksStream)
     EXPECT_TRUE(!c.accepted || got) << "accepted but streams nothing";
 }
 
+// RM-97: driver timestamps were trusted whenever SOAPY_SDR_HAS_TIME was set.
+// SoapyRTLSDR's advance 2x the sample count (with a jump every USB buffer):
+// on a real RTL2838 the RM's packets spanned 7.55 s of timestamp_ns for
+// 3.78 s of samples. Hardware time is now dropped for a stream as soon as it
+// disagrees with the samples, and the sample clock continues seamlessly.
+TEST(AuditRegression, RM97_InconsistentDriverTimestampsAreNotTrusted)
+{
+    for (double scale : {1.0, 2.0})
+    {
+        FakeSoapy::reset();
+        FakeSoapy::hw_time.store(true);
+        FakeSoapy::hw_time_scale.store(scale);
+        FakeSoapy::samples_per_read.store(4096);
+        ResourceManager rm(cfgA(1, 47'360, 47'379), noopState, noopErr);
+        ASSERT_EQ(rm.openDevices(), 1);
+        UdpRx rx;
+        ASSERT_TRUE(rm.tryAccept(continuousReq("t", 915e6, 1e6, 1e6, 1, {rx.port})).accepted);
+        IqPacketHeader                   h{};
+        std::vector<std::complex<float>> iq;
+        ASSERT_TRUE(rx.recv(h, iq, 2000));
+        const uint64_t ts0     = h.timestamp_ns;
+        uint64_t       samples = h.num_samples;
+        double         worst   = 0.0;
+        for (int i = 0; i < 400 && rx.recv(h, iq, 1000); ++i)
+        {
+            const double expect = samples * 1e9 / h.sample_rate;
+            worst = std::max(worst, std::abs((double)(h.timestamp_ns - ts0) - expect));
+            samples += h.num_samples;
+        }
+        std::printf("RM-97: driver time scale %.1f: worst timestamp error %.2f ms over %llu samples\n",
+                    scale,
+                    worst / 1e6,
+                    (unsigned long long)samples);
+        EXPECT_LT(worst, 1e6) << "packet timestamps do not follow the samples (scale " << scale << ")";
+    }
+}
+
 /*
 ========================================================================
 End of file — OpenRFStack

@@ -494,11 +494,8 @@ bool IQStreamer::waitRetuneSettled(std::chrono::milliseconds timeout) const
 
 // ── Live-stream capture (snapshots without a channel of their own) ──────────
 
-bool IQStreamer::capture(int                       n,
-                         std::vector<float>&       out,
-                         double&                   cf_hz,
-                         double&                   sr_hz,
-                         std::chrono::milliseconds timeout)
+bool IQStreamer::capture(
+    int n, std::vector<float>& out, double& cf_hz, double& sr_hz, std::chrono::milliseconds timeout)
 {
     if (n <= 0 || !isRunning())
         return false;
@@ -664,9 +661,12 @@ void IQStreamer::workerLoop()
     double            accum_ns        = 0.0;  // time accumulated at earlier sample rates
     long long         samples_at_rate = 0;    // samples since last rate change / anchor
     double            rate_used       = (double)current_sr_hz_.load(std::memory_order_relaxed);
-    int64_t           next_ts         = 0;  // stream time of the next expected sample
-    Clock::time_point tp_t0{};              // throughput window start
-    double            tp_bytes = 0.0;       // bytes sent in the current window
+    int64_t           next_ts         = 0;      // stream time of the next expected sample
+    bool              had_read        = false;  // a timed read precedes this one
+    double            hw_ref_ns       = 0.0;    // hardware time at the reference point
+    int64_t           hw_ref_samples  = 0;      // samples since the reference point
+    Clock::time_point tp_t0{};                  // throughput window start
+    double            tp_bytes = 0.0;           // bytes sent in the current window
 
     while (running_.load(std::memory_order_acquire))
     {
@@ -750,6 +750,7 @@ void IQStreamer::workerLoop()
                 accum_ns += (double)samples_at_rate * 1e9 / rate_used;
             samples_at_rate = 0;
             rate_used       = sr;
+            had_read        = false;  // re-base the hardware-time check
         }
         const double ns_per_sample = 1e9 / sr;
         int64_t      ts_stream     = next_ts;  // ns since stream_anchor (first sample)
@@ -771,11 +772,50 @@ void IQStreamer::workerLoop()
                 accum_ns        = (double)nsBetween(stream_anchor, t_read) - n * ns_per_sample;
                 samples_at_rate = 0;
             }
+            // Hardware time only while it agrees with the samples: between
+            // overflows it must advance by the samples delivered (drift
+            // measured from a reference re-based at the anchor, after every
+            // overflow and every rate change). SoapyRTLSDR's runs 2x the
+            // sample count with a jump every USB buffer (RTL2838: 7.55 s of
+            // timestamps for 3.78 s of data — RM-97). On the first
+            // disagreement the stream switches to the sample clock,
+            // continuing from the last consistent timestamp.
+            if (use_hw_time && hw)
+            {
+                if (!had_read || (pkt_flags & IQ_FLAG_OVERFLOW))
+                {  // reference point: anchor, or after a real gap (overflow)
+                    hw_ref_ns      = (double)(hw_ts - hw_anchor);
+                    hw_ref_samples = 0;
+                }
+                else
+                {
+                    // Drift from the reference, accumulated: a per-read test
+                    // let a 2x clock through with short reads (1 ms per read).
+                    const double expect = hw_ref_ns + (double)hw_ref_samples * ns_per_sample;
+                    const double got    = (double)(hw_ts - hw_anchor) - expect;
+                    const double tol =
+                        std::max(1e6, 0.005 * (double)hw_ref_samples * ns_per_sample);
+                    if (std::abs(got) > tol)
+                    {
+                        spdlog::warn("IQStreamer [{}] driver timestamps disagree with the sample "
+                                     "count ({:+.1f} ms after {} samples) — using the sample "
+                                     "clock",
+                                     cfg_.stream_id,
+                                     got / 1e6,
+                                     hw_ref_samples);
+                        use_hw_time     = false;
+                        accum_ns        = (double)next_ts;
+                        samples_at_rate = 0;
+                    }
+                }
+            }
             reanchor = false;
             ts_stream =
                 (use_hw_time && hw)
                     ? (int64_t)(hw_ts - hw_anchor)
                     : (int64_t)std::llround(accum_ns + (double)samples_at_rate * ns_per_sample);
+            had_read = true;
+            hw_ref_samples += n;
             samples_at_rate += n;
             next_ts = ts_stream + (int64_t)std::llround(n * ns_per_sample);
         }

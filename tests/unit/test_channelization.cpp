@@ -363,10 +363,18 @@ TEST(Channelization, WidenedDestConvertedToSubBand)
     streamer.removeDest("task-a");
     streamer.addSubBand("task-a", "s-a", 0, "127.0.0.1", port_orig, 100e6, 500e3, 2e6);
 
-    // Task A should now receive narrowband packets on the same port
-    n = recvPacket(fd_orig, buf);
-    ASSERT_GE(n, (ssize_t)IQ_PACKET_HEADER_SIZE) << "No packet after conversion";
-    std::memcpy(&hdr, buf.data(), IQ_PACKET_HEADER_SIZE);
+    // Task A should now receive narrowband packets on the same port. Raw
+    // packets sent before removeDest() may still be queued in the socket
+    // (seen under parallel ASan load): skip those leftovers first.
+    for (int skipped = 0;; ++skipped)
+    {
+        n = recvPacket(fd_orig, buf);
+        ASSERT_GE(n, (ssize_t)IQ_PACKET_HEADER_SIZE) << "No packet after conversion";
+        std::memcpy(&hdr, buf.data(), IQ_PACKET_HEADER_SIZE);
+        const bool leftover = hdr.num_samples == 128u && hdr.center_freq_hz == (uint64_t)100e6;
+        if (!leftover || skipped >= 64)
+            break;
+    }
 
     EXPECT_EQ(hdr.center_freq_hz, (uint64_t)100e6)
         << "Sub-band should report Task A's original CF, not wideband CF";
