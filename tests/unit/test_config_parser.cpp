@@ -302,6 +302,42 @@ TEST(ConfigParser, RxAgcAndGainParsedWhenPresent)
     EXPECT_DOUBLE_EQ(cfg.devices[0].rx_gain_db, 42.5);
 }
 
+// RM-104: values that make the RM unusable are refused at start-up.
+// watchdog_tick_ms / heartbeat_interval_ms 0 spun the RM at 279 % CPU.
+namespace
+{
+std::string withChange(const std::string& from, const std::string& to)
+{
+    std::string x = kSingleDeviceXml;
+    auto        p = x.find(from);
+    EXPECT_NE(p, std::string::npos) << from;
+    if (p != std::string::npos)
+        x.replace(p, from.size(), to);
+    return x;
+}
+}  // namespace
+
+TEST(ConfigParser, RM104_RejectsIntervalsAndCapabilitiesThatCannotWork)
+{
+    ASSERT_NO_THROW(ConfigParser::parse(writeTmp(kSingleDeviceXml)));
+    const std::vector<std::pair<std::string, std::string>> cases = {
+        {"<reconnect_interval_sec>5</reconnect_interval_sec>",
+         "<reconnect_interval_sec>0</reconnect_interval_sec>"},
+        {"<policy>", "<policy><watchdog_tick_ms>0</watchdog_tick_ms>"},
+        {"<policy>", "<policy><heartbeat_interval_ms>0</heartbeat_interval_ms>"},
+        {"<policy>", "<policy><scheduler_tick_ms>-5</scheduler_tick_ms>"},
+        {"<policy>", "<policy><usable_bw_fraction>1.5</usable_bw_fraction>"},
+        {"<policy>", "<policy><max_concurrent_tasks>0</max_concurrent_tasks>"},
+        {"<capabilities>", "<capabilities><freq_min_hz>7e9</freq_min_hz>"},
+        {"<capabilities>", "<capabilities><sample_rate_min_sps>9e9</sample_rate_min_sps>"},
+        {"<capabilities>", "<capabilities><bandwidth_max_hz>0</bandwidth_max_hz>"},
+        {"<capabilities>",
+         "<capabilities><rx_channels>0</rx_channels><tx_channels>0</tx_channels>"},
+    };
+    for (const auto& [from, to] : cases)
+        EXPECT_THROW(ConfigParser::parse(writeTmp(withChange(from, to))), std::runtime_error) << to;
+}
+
 /*
 ========================================================================
 End of file — OpenRFStack

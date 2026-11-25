@@ -143,6 +143,25 @@ AppConfig ConfigParser::parse(const std::string& path)
             "iq_packet_samples must be in [1, 8184] (65507-byte UDP limit); got "
             + std::to_string(cfg.policy.iq_packet_samples));
 
+    // Intervals of 0 made the watchdog / heartbeat / scheduler threads spin:
+    // watchdog_tick_ms and heartbeat_interval_ms 0 ran the RM at 279 % CPU
+    // and published heartbeats without pause (RM-104).
+    auto positive = [](const char* name, long long v)
+    {
+        if (v <= 0)
+            throw std::runtime_error(std::string("<") + name + "> must be > 0; got "
+                                     + std::to_string(v));
+    };
+    positive("scheduler_tick_ms", cfg.policy.scheduler_tick_ms);
+    positive("watchdog_tick_ms", cfg.policy.watchdog_tick_ms);
+    positive("heartbeat_interval_ms", cfg.policy.heartbeat_interval_ms);
+    positive("max_concurrent_tasks", cfg.policy.max_concurrent_tasks);
+    positive("default_task_timeout_ms", cfg.policy.default_task_timeout_ms);
+    positive("reconnect_interval_sec", cfg.broker.reconnect_interval_sec);
+    if (!(cfg.policy.usable_bw_fraction > 0.0 && cfg.policy.usable_bw_fraction <= 1.0))
+        throw std::runtime_error("<usable_bw_fraction> must be in (0, 1]; got "
+                                 + std::to_string(cfg.policy.usable_bw_fraction));
+
     auto* devs = root->FirstChildElement("devices");
     if (!devs)
         throw std::runtime_error("<devices> not found");
@@ -184,6 +203,21 @@ AppConfig ConfigParser::parse(const std::string& path)
             dc.rx_agc       = (agc == "true" || agc == "1");
         }
         dc.rx_gain_db = optD(d, "rx_gain_db", 30.0);
+        // Impossible capabilities made every request fail to fit, with no
+        // hint why (or, for rx_channels < 0, sized vectors negatively).
+        const auto& cp  = dc.caps;
+        auto        bad = [&](const std::string& what)
+        {
+            throw std::runtime_error("<device id=\"" + dc.id + "\">: " + what);
+        };
+        if (cp.rx_channels < 0 || cp.tx_channels < 0 || cp.rx_channels + cp.tx_channels == 0)
+            bad("needs at least one rx or tx channel (and none negative)");
+        if (!(cp.freq_min_hz >= 0.0 && cp.freq_min_hz < cp.freq_max_hz))
+            bad("freq_min_hz must be >= 0 and < freq_max_hz");
+        if (!(cp.sample_rate_max_sps > 0.0 && cp.sample_rate_min_sps <= cp.sample_rate_max_sps))
+            bad("sample_rate_min_sps must be <= sample_rate_max_sps (> 0)");
+        if (!(cp.bandwidth_max_hz > 0.0))
+            bad("bandwidth_max_hz must be > 0");
         cfg.devices.push_back(std::move(dc));
     }
     if (cfg.devices.empty())
