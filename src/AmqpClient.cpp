@@ -137,7 +137,13 @@ public:
 
     void on_transport_error(proton::transport& t) override
     {
-        spdlog::error("AmqpClient: transport error: {}", t.error().what());
+        // stop() aborts the connection (container::stop()): proton reports
+        // that as "framing-error: connection aborted" — expected, not an
+        // error, and it was logged as one on every shutdown.
+        if (parent_.stopping())
+            spdlog::info("AmqpClient: connection closed for shutdown ({})", t.error().what());
+        else
+            spdlog::error("AmqpClient: transport error: {}", t.error().what());
         parent_.onDisconnected();
     }
 

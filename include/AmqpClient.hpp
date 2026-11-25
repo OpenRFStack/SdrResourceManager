@@ -64,6 +64,17 @@ public:
     void sendStatus(const std::string& json_body);
     void sendHealth(const std::string& json_body);
 
+    /// stop() has begun (transport errors from here on are the shutdown).
+
+    bool stopping() const
+
+    {
+
+        return !running_.load();
+
+    }
+
+
     bool isConnected() const
     {
         return connected_.load();
